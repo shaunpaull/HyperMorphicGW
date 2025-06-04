@@ -1,0 +1,2156 @@
+#!/usr/bin/env python3
+"""
+HyperMorphic Gravitational Wave Analysis
+Based on V13 HyperMorphic Mathematics Framework
+Tests for context ripples and HyperMorphic signatures in LIGO/Virgo data
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from scipy import signal, fft
+from scipy.signal import stft # Added for DynamicRippleTracker
+# Ensure gwpy is available or handle its absence gracefully for core functionality
+try:
+    from gwpy.timeseries import TimeSeries
+    from gwpy.signal import filter_design
+    GWPY_AVAILABLE = True
+except ImportError:
+    GWPY_AVAILABLE = False
+    print("Warning: gwpy library not found. Real data fetching and some TimeSeries functionalities will be unavailable.")
+    # Define a placeholder TimeSeries if gwpy is not available, for basic script structure to work
+    class TimeSeries:
+        def __init__(self, data, sample_rate=None, t0=None, name=None, times=None, **kwargs):
+            self.value = np.asarray(data)
+            self._name = name if name is not None else "PlaceholderTimeSeries"
+            self._t0 = t0 if t0 is not None else 0
+            self._sample_rate_val = sample_rate if sample_rate is not None else 1.0
+            
+            if times is not None:
+                self._times = np.asarray(times)
+                if len(self.value) != len(self._times) and len(self.value) > 0 : # Allow empty timeseries value
+                     raise ValueError("Length of data and times must match.")
+                if len(self.value) > 1 and self._times is not None: # Avoid error if times is None or too short
+                     if self._times[1] - self._times[0] != 0: # Avoid division by zero
+                         self._sample_rate_val = 1.0 / (self._times[1] - self._times[0])
+                     else: # Handle case where time difference is zero (e.g. single point or duplicate times)
+                         self._sample_rate_val = 1.0 # Default or raise error
+            elif self._sample_rate_val > 0 and len(self.value) > 0:
+                self._times = np.arange(len(self.value)) / self._sample_rate_val + self._t0
+            else:
+                self._times = np.array([])
+
+
+            self.name = self._name
+            # Mock some attributes and methods if gwpy is not available
+            class ValueWrapper:
+                def __init__(self, val): self.value = val
+            self.sample_rate = ValueWrapper(self._sample_rate_val)
+            self.t0 = ValueWrapper(self._t0)
+            
+            if len(self.value) > 0 and self._sample_rate_val > 0 :
+                 self.duration = ValueWrapper(len(self.value) / self._sample_rate_val)
+            else:
+                 self.duration = ValueWrapper(0)
+
+        @property
+        def times(self):
+            # Ensure _times is initialized even for an empty TimeSeries object
+            if not hasattr(self, '_times'):
+                self._times = np.array([])
+            class ValueWrapper: # Inner class needs to be accessible
+                def __init__(self, val): self.value = val
+            return ValueWrapper(self._times)
+        
+        def __len__(self):
+            return len(self.value)
+
+        def crop(self, start, end): # Mock method
+            print(f"Mock crop called for {self.name} between {start} and {end}. Returning self (no actual crop).")
+            return self
+        def filter(self, *args, **kwargs): # Mock method
+            print(f"Mock filter called for {self.name}. Returning self (no actual filter).")
+            return self
+        def whiten(self, *args, **kwargs): # Mock method
+            print(f"Mock whiten called for {self.name}. Returning self (no actual whiten).")
+            return self
+
+
+from scipy.ndimage import gaussian_filter # Added for CMB mock and Zeno map smoothing
+import copy # For deep copying objects if needed
+
+
+# HyperMorphic Constants from V13
+EPSILON_PHI_VALUE = 1e-50  # This will be modified by the EpsilonSensitivitySweeper
+TMR_SAFETY_FACTOR_K = 2.0 
+
+# Global mode setting (as in original code)
+HYPERMORPHIC_MODE = "AdaptiveV13_Stronger"
+
+# --- Core HNum and HyperMorphic Math ---
+class HNum:
+    """HyperMorphic Number implementation based on V13 findings"""
+
+    def __init__(self, value, dimension=0):
+        self.dimension = dimension
+        self.history = [] 
+        current_epsilon_phi = EPSILON_PHI_VALUE
+
+        if isinstance(value, HNum):
+            self.value = value.value
+            self.is_epsilon = value.is_epsilon
+        elif isinstance(value, (int, float, complex)):
+            if abs(value - current_epsilon_phi) < current_epsilon_phi * 10: 
+                self.value = complex(current_epsilon_phi, 0)
+                self.is_epsilon = True
+            elif abs(value) < current_epsilon_phi * 0.001: 
+                 self.value = complex(current_epsilon_phi, 0) 
+                 self.is_epsilon = True
+            else:
+                self.value = complex(value)
+                self.is_epsilon = False
+        elif isinstance(value, str) and value == "EPSILON_PHI":
+            self.value = complex(current_epsilon_phi, 0)
+            self.is_epsilon = True
+        else: 
+            try:
+                val_complex = complex(value)
+                if abs(val_complex) < current_epsilon_phi * 0.001: 
+                    self.value = complex(current_epsilon_phi, 0)
+                    self.is_epsilon = True
+                else:
+                    self.value = val_complex
+                    self.is_epsilon = False
+            except (TypeError, ValueError):
+                raise ValueError(f"Cannot initialize HNum with value: {value} of type {type(value)}")
+
+
+    def _is_numerically_zero(self, val, tol_factor=0.001):
+        return abs(val) < (EPSILON_PHI_VALUE * tol_factor)
+
+    def _is_numerically_epsilon(self, val, tol_factor=10):
+        return abs(val - EPSILON_PHI_VALUE) < (EPSILON_PHI_VALUE * tol_factor)
+
+    def __repr__(self):
+        if self.is_epsilon:
+            return f"HNum(ε_ℍ@{EPSILON_PHI_VALUE:.0e}, dim={self.dimension})"
+        return f"HNum({self.value.real:.3e}{self.value.imag:+.3e}j, dim={self.dimension})"
+
+    def _prepare_operand(self, other):
+        if not isinstance(other, HNum):
+            return HNum(other, self.dimension) 
+        return other
+
+    def _create_result(self, val, op_desc):
+        result = HNum(val, self.dimension) 
+        return result
+
+    def add(self, other, op_ctx="add"):
+        other = self._prepare_operand(other)
+        if self.is_epsilon and other.is_epsilon:
+            return HNum("EPSILON_PHI", self.dimension)
+
+        raw_val = self.value + other.value
+        phi = phi_dynamic_base(self.dimension, abs(raw_val), op_ctx)
+
+        if self.is_epsilon and not other.is_epsilon:
+            result_val = complex_mod(other.value, phi)
+        elif not self.is_epsilon and other.is_epsilon:
+            result_val = complex_mod(self.value, phi)
+        elif self._is_numerically_zero(raw_val): 
+            return HNum("EPSILON_PHI", self.dimension)
+        else:
+            result_val = complex_mod(raw_val, phi)
+        return self._create_result(result_val, f"add({op_ctx})")
+
+    def multiply(self, other, op_ctx="mul"):
+        other = self._prepare_operand(other)
+        if self.is_epsilon or other.is_epsilon: 
+            return HNum("EPSILON_PHI", self.dimension)
+
+        raw_val = self.value * other.value
+        psi = psi_dynamic_modulus(self.dimension, abs(raw_val), op_ctx)
+        result_val = complex_mod(raw_val, psi)
+        if self._is_numerically_zero(result_val):
+             return HNum("EPSILON_PHI", self.dimension)
+        return self._create_result(result_val, f"mul({op_ctx})")
+
+    def subtract(self, other, op_ctx="sub"):
+        other = self._prepare_operand(other)
+        if self.is_epsilon and other.is_epsilon: 
+            return HNum("EPSILON_PHI", self.dimension)
+
+        raw_val = self.value - other.value
+        phi = phi_dynamic_base(self.dimension, abs(raw_val), op_ctx)
+
+        if abs(raw_val) < EPSILON_PHI_VALUE * 0.1: 
+            return HNum("EPSILON_PHI", self.dimension)
+
+        result_val = complex_mod(raw_val, phi)
+        return self._create_result(result_val, f"sub({op_ctx})")
+
+    def divide(self, other, op_ctx="div"):
+        other = self._prepare_operand(other)
+        current_epsilon_phi = EPSILON_PHI_VALUE 
+
+        if other.is_epsilon: 
+            if self.is_epsilon: 
+                raw_val = 1.0 + 0j 
+            else: 
+                raw_val = self.value / complex(current_epsilon_phi, current_epsilon_phi) 
+        elif self._is_numerically_zero(other.value): 
+            if self.is_epsilon: 
+                return HNum("EPSILON_PHI", self.dimension)
+            else: 
+                raw_val = self.value / complex(current_epsilon_phi, current_epsilon_phi) 
+        elif self.is_epsilon: 
+            return HNum("EPSILON_PHI", self.dimension)
+        else:
+            raw_val = self.value / other.value
+
+        psi = psi_dynamic_modulus(self.dimension, abs(raw_val), op_ctx)
+        result_val = complex_mod(raw_val, psi)
+
+        if self._is_numerically_zero(result_val):
+            return HNum("EPSILON_PHI", self.dimension)
+        return self._create_result(result_val, f"div({op_ctx})")
+
+    def abs_H(self):
+        if self.is_epsilon:
+            return HNum("EPSILON_PHI", self.dimension)
+        return HNum(abs(self.value), self.dimension)
+
+    def D_phi(self, f, h_factor=1e-7):
+        h_raw_val = abs(self.value.real) * h_factor if abs(self.value.real) > 1e-100 else 1e-100
+        h_val = min(max(EPSILON_PHI_VALUE * 1e10, h_raw_val), 1e-4) 
+        h_complex = complex(h_val, 0) 
+
+        x_plus_h = HNum(self.value + h_complex, self.dimension)
+        x_minus_h = HNum(self.value - h_complex, self.dimension)
+
+        f_plus = f(x_plus_h)  
+        f_minus = f(x_minus_h) 
+
+        numerator = f_plus.subtract(f_minus, "D_phi_num")
+        
+        h_hnum = HNum(h_complex, self.dimension) 
+        if h_hnum.is_epsilon and h_val > EPSILON_PHI_VALUE * 100 : 
+            h_hnum = HNum(h_val, self.dimension) 
+
+        two_h = HNum(2.0, self.dimension).multiply(h_hnum, "D_phi_den_2h")
+
+        if two_h.is_epsilon: 
+            return HNum(1.0 / EPSILON_PHI_VALUE, self.dimension) 
+            
+        return numerator.divide(two_h, "D_phi_quot")
+
+def complex_mod(z, N):
+    if not isinstance(N, (int, float, np.number)) or N == 0: 
+        if N == 0: return complex(0,0) 
+        N_abs = abs(N)
+        if N_abs == 0: return complex(0,0)
+        N = N_abs 
+
+    if N < 0: N = abs(N)
+    if N == 0: return complex(0,0) 
+
+    real_part = np.fmod(z.real, N)
+    imag_part = np.fmod(z.imag, N)
+    return complex(real_part, imag_part)
+
+def phi_dynamic_base(dimension, current_val_magnitude, op_context):
+    global HYPERMORPHIC_MODE
+    if HYPERMORPHIC_MODE == "ClassicalMimicry": return int(1e18) 
+    elif HYPERMORPHIC_MODE == "Aggressive":
+        base_val = 10
+        oscillation = 2 * np.sin(dimension * 0.5)
+        mag_factor = np.log1p(current_val_magnitude)
+        return max(1, int(np.round(base_val + oscillation + mag_factor)))
+    elif HYPERMORPHIC_MODE == "AdaptiveV13_Stronger":
+        if dimension == 0:
+            base_val = 10 + (current_val_magnitude ** 1.8) + current_val_magnitude * 200
+            base_val += np.log1p(current_val_magnitude) * 10
+        else:
+            base_val = 10 + dimension + 3 * np.sin(dimension * 0.3)
+            base_val += np.log1p(current_val_magnitude) * (dimension + 1)
+            base_val += (current_val_magnitude ** 1.5)
+            base_val += current_val_magnitude * ((dimension * 0.1) + 0.2)
+        return max(1, int(np.round(base_val)))
+    elif HYPERMORPHIC_MODE == "MeasurementContext": # Potentially useful for Zeno
+        base_val = 5 + dimension % 3
+        base_val += np.log1p(current_val_magnitude) * 0.1
+        return max(1, int(np.round(base_val)))
+    else: return 100 
+
+def psi_dynamic_modulus(dimension, current_val_magnitude, op_context):
+    global HYPERMORPHIC_MODE
+    if HYPERMORPHIC_MODE == "ClassicalMimicry": return int(1e18) 
+    elif HYPERMORPHIC_MODE == "Aggressive":
+        mod_val = 15
+        oscillation = 3 * np.cos(dimension * 0.4)
+        mag_factor = 2 * np.log1p(current_val_magnitude) + np.sqrt(current_val_magnitude)
+        return max(1, int(np.round(mod_val + oscillation + mag_factor)))
+    elif HYPERMORPHIC_MODE == "AdaptiveV13_Stronger":
+        if dimension == 0:
+            mod_val = 150 + (current_val_magnitude ** 1.8) + current_val_magnitude * 100
+            mod_val += np.log1p(current_val_magnitude) * 2.5
+        else:
+            mod_val = 15 + dimension * 2 + 4 * np.cos(dimension * 0.2)
+            mod_val += np.log1p(current_val_magnitude) * 0.5 * (dimension + 2)
+            mod_val += (current_val_magnitude ** 1.2)
+            mod_val += current_val_magnitude * (dimension * 0.05 + 0.1)
+        return max(1, int(np.round(mod_val)))
+    elif HYPERMORPHIC_MODE == "MeasurementContext": # Potentially useful for Zeno
+        mod_val = 7 + dimension % 5
+        mod_val += np.log1p(current_val_magnitude) * 0.2
+        return max(1, int(np.round(mod_val)))
+    else: return 150 
+
+class HyperMorphicGWAnalyzer:
+    def __init__(self):
+        self.sample_rate = 4096  # Hz
+        self.gw_events = {
+            'GW150914': {'time': 1126259462.4, 'duration': 1.0, 'detectors': ['H1', 'L1']},
+            'GW170817': {'time': 1187008882.4, 'duration': 32.0, 'detectors': ['H1', 'L1', 'V1']}
+        }
+        self.results = {} 
+        self.epsilon_sweeper = EpsilonSensitivitySweeper(self)
+        self.interference_engine = WaveInterferenceEngine(self)
+        self.gate_drift_engine = GateDriftEngine(self)
+        self.synthetic_source_engine = SyntheticSourceEngine(self)
+        self.dynamic_ripple_tracker = DynamicRippleTracker(self)
+        self.optional_feature_analyzer = OptionalFeatureAnalyzer(self)
+        self.entanglement_analyzer = EntanglementAnalyzer(self) 
+
+
+    def create_title_banner(self): 
+        fig, ax = plt.subplots(1, 1, figsize=(16, 3), facecolor='black')
+        ax.set_facecolor('black'); ax.set_xlim(0, 10); ax.set_ylim(0, 1); ax.axis('off')
+        title_text = "HyperMorphic Gravitational Wave Analysis"
+        subtitle_text = f"ε_ℍ = {EPSILON_PHI_VALUE:.1e} | Mode: {HYPERMORPHIC_MODE}"
+        for offset, alpha_val in [(0.02, 0.3), (0.01, 0.5), (0, 1.0)]: 
+            ax.text(5, 0.6 + offset, title_text, fontsize=28, fontweight='bold', ha='center', va='center', color='#BF40BF' if offset > 0 else 'white', alpha=alpha_val)
+        ax.text(5, 0.3, subtitle_text, fontsize=14, ha='center', va='center', color='#00FFFF', alpha=0.9)
+        x = np.linspace(0, 10, 1000)
+        y1 = 0.1 + 0.05 * np.sin(2 * np.pi * x)
+        y2 = 0.9 + 0.05 * np.sin(2 * np.pi * x + np.pi)
+        for width, alpha_w in [(3, 0.3), (2, 0.5), (1, 0.8)]: 
+            ax.plot(x, y1, color='#00FFFF', linewidth=width, alpha=alpha_w)
+            ax.plot(x, y2, color='#BF40BF', linewidth=width, alpha=alpha_w)
+        plt.tight_layout()
+        return fig
+
+    def fetch_gw_data(self, event='GW150914', detector='H1'):
+        if not GWPY_AVAILABLE:
+            print(f"  GWPY not available. Generating synthetic GW for {detector} (duration: {self.gw_events.get(event,{}).get('duration',1.0):.2f}s) instead.")
+            return self.generate_synthetic_gw(duration=self.gw_events.get(event,{}).get('duration',1.0))
+
+        print(f"Attempting to fetch real data for {event} ({detector})...")
+        event_info = self.gw_events.get(event)
+        if not event_info:
+            print(f"  Event {event} not found in definitions. Generating synthetic GW.")
+            return self.generate_synthetic_gw(duration=1.0) 
+
+        gps_time = event_info['time']
+        target_duration = event_info['duration'] 
+        
+        analysis_start_time = gps_time - target_duration / 2
+        analysis_end_time = gps_time + target_duration / 2
+
+        min_processing_duration = 4.0 
+        processing_buffer_each_side = (min_processing_duration - target_duration) / 2.0 if target_duration < min_processing_duration else 1.0
+        processing_buffer_each_side = max(0.5, processing_buffer_each_side) 
+
+        processing_start_time = analysis_start_time - processing_buffer_each_side
+        processing_end_time = analysis_end_time + processing_buffer_each_side
+        processing_duration = target_duration + 2 * processing_buffer_each_side
+
+        fetch_buffer_each_side = max(2.0, processing_duration * 0.25) 
+        fetch_start = processing_start_time - fetch_buffer_each_side
+        fetch_end = processing_end_time + fetch_buffer_each_side
+        
+        data_to_process = None
+        try:
+            data_fetched = TimeSeries.fetch_open_data(
+                detector, fetch_start, fetch_end,
+                sample_rate=self.sample_rate,
+                cache=True, verbose=False, timeout=30 
+            )
+            
+            if data_fetched is None or not hasattr(data_fetched, 'value') or len(data_fetched.value) == 0 :
+                 raise ValueError("fetch_open_data returned None or empty data.")
+            
+            data_to_process = data_fetched.crop(processing_start_time, processing_end_time)
+
+            min_processing_samples = int(processing_duration * self.sample_rate * 0.90) 
+            if data_to_process is None or not hasattr(data_to_process, 'value') or len(data_to_process.value) < min_processing_samples:
+                actual_len_proc = len(data_to_process.value) if (data_to_process is not None and hasattr(data_to_process, 'value')) else "None/Empty"
+                raise ValueError(f"Data for processing window is too short ({actual_len_proc} samples, needed ~{min_processing_samples}). Fetched span was [{data_fetched.span.start:.2f}, {data_fetched.span.end:.2f}].")
+
+            bp = filter_design.bandpass(50, 250, self.sample_rate)
+            data_to_process = data_to_process.filter(bp, filtfilt=True) 
+            
+            whiten_seg_dur = min(2.0, data_to_process.duration.value * 0.5 if hasattr(data_to_process,'duration') and data_to_process.duration.value > 0 else 2.0) 
+            whiten_ovlp_dur = whiten_seg_dur / 2
+            current_data_duration = data_to_process.duration.value if hasattr(data_to_process,'duration') else 0
+
+            if whiten_seg_dur > 0.2 and current_data_duration >= whiten_seg_dur: 
+                 data_to_process = data_to_process.whiten(whiten_seg_dur, whiten_ovlp_dur)
+            else:
+                print(f"  Skipping whitening for {detector} as data segment ({current_data_duration:.2f}s) too short for {whiten_seg_dur:.2f}s window.")
+
+            if not hasattr(data_to_process, 'value') or len(data_to_process.value) == 0: 
+                raise ValueError("Data became empty after filtering/whitening.")
+
+            final_data = data_to_process.crop(analysis_start_time, analysis_end_time)
+            
+            min_analysis_samples = int(target_duration * self.sample_rate * 0.90) 
+            if final_data is None or not hasattr(final_data, 'value') or len(final_data.value) < min_analysis_samples:
+                actual_len_final = len(final_data.value) if (final_data is not None and hasattr(final_data, 'value')) else "None/Empty"
+                raise ValueError(f"Final cropped data for analysis is too short ({actual_len_final} samples, needed ~{min_analysis_samples}).")
+
+            print(f"  Real data for {detector} ({event}) processed successfully. Final length: {len(final_data.value)} samples.")
+            return final_data
+
+        except Exception as e:
+            print(f"  Error during multi-stage fetch/crop/process for {event} ({detector}): {e}")
+            print(f"  Generating synthetic GW for {detector} (duration: {target_duration:.2f}s) instead.")
+            return self.generate_synthetic_gw(duration=target_duration)
+
+
+    def generate_synthetic_gw(self, duration=1.0, f0=35, f1=250): 
+        num_samples = int(duration * self.sample_rate)
+        if num_samples <= 0: 
+            return TimeSeries(np.array([]), sample_rate=self.sample_rate, t0=0, name=f"Synth_Empty_{duration:.2f}s")
+
+        t = np.linspace(0, duration, num_samples, endpoint=False)
+        c = (f1 - f0) / duration if duration > 0 else 0
+        phase = 2 * np.pi * (f0 * t + 0.5 * c * t**2)
+        amplitude = 1e-21 * (1 + 10 * (t / duration if duration > 0 else 0))**2 
+        noise = np.random.normal(0, 2e-22, len(t)) 
+        strain = amplitude * np.sin(phase) + noise
+        return TimeSeries(strain, sample_rate=self.sample_rate, t0=0, name=f"Synth_{duration:.2f}s")
+
+    def hypermorphic_transform(self, data_input, dimension=0): 
+        h_data = []
+        raw_values = data_input.value if hasattr(data_input, 'value') else data_input
+
+        for i, val in enumerate(raw_values):
+            dim = dimension + (i % 10)  
+            h_val = HNum(val, dim)
+            h_data.append(h_val)
+        return h_data
+
+    def hypermorphic_fft(self, h_data): 
+        n = len(h_data)
+        if n == 0: return []
+        h_fft_output = [] 
+        for k in range(n//2): 
+            sum_h = HNum(0, k) 
+            for j in range(n):
+                angle = -2 * np.pi * k * j / n
+                twiddle_val = complex(np.cos(angle), np.sin(angle))
+                h_twiddle = HNum(twiddle_val, k) 
+                contrib = h_data[j].multiply(h_twiddle, op_ctx=f"fft_k{k}_j{j}")
+                sum_h = sum_h.add(contrib, op_ctx=f"fft_sum_k{k}")
+            h_fft_output.append(sum_h)
+        return h_fft_output
+
+    def detect_context_ripples(self, h_fft_output, classical_fft_segment): 
+        deviations = []
+        frequencies = []
+        
+        len_classical_fft_segment = len(classical_fft_segment)
+        if len_classical_fft_segment == 0 or not h_fft_output or len(h_fft_output) == 0: 
+            return np.array(frequencies), np.array(deviations)
+
+        num_freq_bins_to_compare = min(len(h_fft_output), len_classical_fft_segment)
+        N_classical_equiv = 2 * len_classical_fft_segment if len_classical_fft_segment > 0 else 1 
+
+        for k in range(num_freq_bins_to_compare):
+            if k >= len(h_fft_output) or k >= len(classical_fft_segment): continue 
+            h_val_complex = h_fft_output[k].value
+            c_val_complex = classical_fft_segment[k]
+            h_abs = abs(h_val_complex)
+            c_abs = abs(c_val_complex)
+
+            if c_abs > 1e-30: 
+                dev = abs(h_abs - c_abs) / c_abs
+                deviations.append(dev)
+                frequencies.append(k * self.sample_rate / N_classical_equiv) 
+        return np.array(frequencies), np.array(deviations)
+
+    def analyze_hypermorphic_signature(self, data1_input, data2_input):  
+        data1_ts = data1_input if isinstance(data1_input, TimeSeries) else TimeSeries(data1_input, sample_rate=self.sample_rate)
+        data2_ts = data2_input if isinstance(data2_input, TimeSeries) else TimeSeries(data2_input, sample_rate=self.sample_rate)
+            
+        h_data1 = self.hypermorphic_transform(data1_ts.value, dimension=0) 
+        h_data2 = self.hypermorphic_transform(data2_ts.value, dimension=1) 
+
+        min_len_h = min(len(h_data1), len(h_data2)) 
+        h_data1 = h_data1[:min_len_h]; h_data2 = h_data2[:min_len_h]
+        
+        min_len_raw = min(len(data1_ts.value), len(data2_ts.value))
+        raw_data1 = data1_ts.value[:min_len_raw]; raw_data2 = data2_ts.value[:min_len_raw]
+
+        max_lag = min(100, min_len_h // 4 if min_len_h > 3 else 1) 
+        if max_lag <=0 : max_lag = min(1, min_len_h-1 if min_len_h > 0 else 0) 
+
+        h_xcorr_values = []; lags = list(range(-max_lag, max_lag + 1))
+
+        for lag_val in lags:
+            sum_h = HNum(0, abs(lag_val)) 
+            if lag_val >= 0:
+                for i in range(min_len_h - lag_val): sum_h = sum_h.add(h_data1[i].multiply(h_data2[i + lag_val]), "xcorr")
+            else: 
+                 for i in range(min_len_h + lag_val): sum_h = sum_h.add(h_data1[i - lag_val].multiply(h_data2[i]), "xcorr")
+            h_xcorr_values.append(sum_h.value)
+        
+        classical_xcorr_segment = []
+        if len(raw_data1) > 0 and len(raw_data2) > 0:
+            corr_len = min(len(raw_data1), len(raw_data2)) 
+            classical_xcorr_full = np.correlate(raw_data1[:corr_len], raw_data2[:corr_len], mode='full')
+            center_idx_full = corr_len -1 
+            for lag_val in lags:
+                idx_in_full = center_idx_full + lag_val
+                if 0 <= idx_in_full < len(classical_xcorr_full): classical_xcorr_segment.append(classical_xcorr_full[idx_in_full])
+                else: classical_xcorr_segment.append(0) 
+        else: classical_xcorr_segment = [0] * len(lags)
+        return np.array(h_xcorr_values), np.array(classical_xcorr_segment), np.array(lags)
+
+
+    def plot_results(self, event_name, current_results): 
+        plt.style.use('dark_background')
+        electric_purple = '#BF40BF'; electric_blue = '#00FFFF'; neon_pink = '#FF10F0'
+        bright_violet = '#9D00FF'; cyan_blue = '#00E5FF'; deep_purple = '#6B0F9F'
+        fig, axes = plt.subplots(3, 2, figsize=(16, 13), facecolor='black')
+        fig.suptitle(f'HyperMorphic Analysis of {event_name} (ε_H={EPSILON_PHI_VALUE:.1e})',
+                    fontsize=20, color=electric_purple, fontweight='bold')
+        for ax_row in axes:
+            for ax in ax_row:
+                ax.set_facecolor('black'); ax.grid(True, alpha=0.2, color=deep_purple, linestyle=':')
+                for spine in ax.spines.values(): spine.set_color(electric_purple)
+                ax.tick_params(colors=cyan_blue)
+                ax.xaxis.label.set_color(electric_blue); ax.yaxis.label.set_color(electric_blue)
+                ax.title.set_color(electric_purple)
+
+        ax = axes[0, 0]
+        time_data = current_results.get('time')
+        strain_h1_data = current_results.get('strain_h1')
+        strain_l1_data = current_results.get('strain_l1')
+        if time_data is not None and strain_h1_data is not None and len(time_data) > 0 and len(strain_h1_data) == len(time_data) :
+            for width, alpha_val in [(3, 0.3), (2, 0.5), (1, 0.8)]:
+                ax.plot(time_data, strain_h1_data, color=electric_blue, alpha=alpha_val, linewidth=width)
+                if strain_l1_data is not None and len(strain_l1_data) == len(time_data):
+                     ax.plot(time_data, strain_l1_data, color=electric_purple, alpha=alpha_val, linewidth=width)
+            ax.plot(time_data, strain_h1_data, color=electric_blue, alpha=1.0, linewidth=0.8, label='H1' if strain_l1_data is not None else 'Signal')
+            if strain_l1_data is not None and len(strain_l1_data) == len(time_data):
+                ax.plot(time_data, strain_l1_data, color=electric_purple, alpha=1.0, linewidth=0.8, label='L1')
+            handles, labels = ax.get_legend_handles_labels()
+            if labels: ax.legend(handles, labels, facecolor='black', edgecolor=electric_purple, labelcolor='white')
+        else: ax.text(0.5, 0.5, "Time series data missing/invalid", color="grey", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Strain'); ax.set_title('Gravitational Wave Signals', fontsize=14)
+
+        ax = axes[0, 1]
+        freq = current_results.get('freq_classical')
+        psd = current_results.get('psd_classical')
+        if freq is not None and psd is not None and len(freq) > 0 and len(psd) == len(freq):
+            ax.semilogy(freq, psd, color=cyan_blue, linewidth=2, alpha=0.9)
+            fill_min = psd[psd>0].min() * 0.1 if np.any(psd>0) else 1e-50
+            ax.fill_between(freq, fill_min , psd, color=electric_blue, alpha=0.3) 
+            for i in range(5): ax.semilogy(freq, psd * (1 + i*0.2), color=electric_blue, alpha=0.1, linewidth=3-i*0.5)
+            ax.set_xlim(max(20, freq.min() if freq.size > 0 else 20), 
+                        min(max(500, freq.max()*0.8 if freq.size > 0 else 500), self.sample_rate/2))
+            ax.set_ylim(bottom=max(psd[psd>0].min()*0.01 if np.any(psd>0) else 1e-50, 1e-50))
+        else: ax.text(0.5, 0.5, "PSD data missing or invalid", color="grey", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel('Frequency (Hz)'); ax.set_ylabel('Power Spectral Density'); ax.set_title('Frequency Domain Spectrum', fontsize=14)
+
+        ax = axes[1, 0]
+        ripple_freq = current_results.get('ripple_freq')
+        ripple_dev = current_results.get('ripple_dev')
+        if ripple_freq is not None and ripple_dev is not None and len(ripple_freq) > 0 and len(ripple_dev) == len(ripple_freq):
+            for size, alpha_val in [(100, 0.1), (50, 0.2), (20, 0.4)]:
+                ax.scatter(ripple_freq, ripple_dev, color=neon_pink, s=size, alpha=alpha_val, edgecolors='none')
+            ax.scatter(ripple_freq, ripple_dev, color='white', s=5, alpha=0.9, edgecolors=neon_pink, linewidths=0.5)
+            ax.axhline(y=EPSILON_PHI_VALUE, color=bright_violet, linestyle='--', linewidth=2, alpha=0.8, label=f'ε_ℍ ({EPSILON_PHI_VALUE:.0e})')
+            ax.legend(facecolor='black', edgecolor=electric_purple, labelcolor='white')
+            ax.set_yscale('log')
+        else: ax.text(0.5, 0.5, "Ripple data missing or invalid", color="grey", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel('Frequency (Hz)'); ax.set_ylabel('Relative Deviation'); ax.set_title('Context Ripples (H vs Classical)', fontsize=14)
+        
+        ax = axes[1, 1]
+        mode_colors = {'Aggressive': neon_pink, 'AdaptiveV13_Stronger': electric_blue, 'ClassicalMimicry': bright_violet}
+        plotted_modes = False
+        mode_devs = current_results.get('mode_deviations',{})
+        base_ripple_freq_for_modes = current_results.get('ripple_freq') 
+
+        if mode_devs and base_ripple_freq_for_modes is not None:
+            for mode, dev_values in mode_devs.items():
+                if dev_values is not None and len(dev_values) > 0:
+                    color = mode_colors.get(mode, 'white')
+                    if len(base_ripple_freq_for_modes) >= len(dev_values):
+                        plot_freq = base_ripple_freq_for_modes[:len(dev_values)]
+                    else: 
+                        plot_freq = np.linspace(0, self.sample_rate/2, len(dev_values)) if self.sample_rate > 0 else np.arange(len(dev_values))
+                    
+                    if len(plot_freq) == len(dev_values) and len(plot_freq) > 0:
+                        plotted_modes = True
+                        for width, alpha_val in [(4, 0.3), (2, 0.6)]: ax.plot(plot_freq, dev_values, color=color, alpha=alpha_val, linewidth=width)
+                        ax.plot(plot_freq, dev_values, label=mode, color=color, alpha=1.0, linewidth=1.5)
+            if plotted_modes: ax.legend(facecolor='black', edgecolor=electric_purple, labelcolor='white'); ax.set_yscale('log')
+            else: ax.text(0.5, 0.5, "No mode deviation data to plot", color="grey", ha="center", va="center", transform=ax.transAxes)
+        else: ax.text(0.5, 0.5, "Mode deviation or base ripple freq data missing", color="grey", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel('Frequency (Hz)'); ax.set_ylabel('Mean Deviation'); ax.set_title('Mode-Dependent Deviations', fontsize=14)
+
+        ax = axes[2, 0]
+        lags = current_results.get('xcorr_lags'); h_xcorr = current_results.get('h_xcorr'); c_xcorr = current_results.get('c_xcorr')
+        if lags is not None and h_xcorr is not None and c_xcorr is not None and \
+           len(lags)>0 and len(h_xcorr)==len(lags) and len(c_xcorr)==len(lags):
+            h_xcorr_real = np.real(h_xcorr) 
+            for width, alpha_val in [(5, 0.2), (3, 0.4), (1.5, 0.7)]: ax.plot(lags, h_xcorr_real, color=electric_blue, alpha=alpha_val, linewidth=width)
+            ax.plot(lags, h_xcorr_real, color=electric_blue, linewidth=1.2, label='HyperMorphic')
+            ax.plot(lags, c_xcorr, color=electric_purple, linewidth=1.5, alpha=0.8, linestyle='--', label='Classical')
+            ax.legend(facecolor='black', edgecolor=electric_purple, labelcolor='white')
+        else: ax.text(0.5, 0.5, "Cross-correlation data missing or invalid", color="grey", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel('Lag (samples)'); ax.set_ylabel('Cross-correlation'); ax.set_title('H1-L1 Cross-correlation', fontsize=14)
+
+        ax = axes[2, 1]
+        epsilon_count = current_results.get('epsilon_count')
+        if epsilon_count:
+            labels = ['Classical'] + list(epsilon_count.keys()) 
+            values = [0] + [epsilon_count.get(mode,0) for mode in epsilon_count.keys()]
+            max_val_eps = max(values) if values else 0 
+            x_pos = np.arange(len(labels))
+            bars = ax.bar(x_pos, values, color=electric_blue, edgecolor=electric_purple, linewidth=2, alpha=0.8)
+            for bar_idx, bar_item in enumerate(bars): 
+                height = bar_item.get_height()
+                if height > 0 and bar_idx > 0 : 
+                    ax.text(bar_item.get_x() + bar_item.get_width()/2., height + max_val_eps*0.02 if max_val_eps>0 else height+0.1, str(int(height)), ha='center', color='white', fontweight='bold')
+            ax.set_xticks(x_pos); ax.set_xticklabels(labels, color=cyan_blue, rotation=45, ha="right")
+        else: ax.text(0.5, 0.5, "Epsilon count data missing", color="grey", ha="center", va="center", transform=ax.transAxes)
+        ax.set_ylabel('ε_ℍ Occurrences'); ax.set_title('Epsilon Influence by Mode', fontsize=14)
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) 
+        fig.patch.set_edgecolor(electric_purple); fig.patch.set_linewidth(2)
+        return fig
+
+    def create_ripple_visualization(self, current_results): 
+        fig = plt.figure(figsize=(10, 10), facecolor='black') 
+        ax = fig.add_subplot(111, projection='3d', facecolor='black')
+        theta, r_val = np.linspace(0, 2*np.pi, 100), np.linspace(0, 1, 50) 
+        T, R_mesh = np.meshgrid(theta, r_val) 
+        Z = np.zeros_like(T) 
+
+        ripple_dev_data = current_results.get('ripple_dev')
+        if ripple_dev_data is not None and len(ripple_dev_data) > 0:
+            finite_ripple_dev = ripple_dev_data[np.isfinite(ripple_dev_data)]
+            dev_mean = np.mean(finite_ripple_dev) if len(finite_ripple_dev)>0 else 0
+            dev_std = np.std(finite_ripple_dev) if len(finite_ripple_dev)>0 else 0
+            if np.isfinite(dev_mean) and np.isfinite(dev_std) and dev_std > 1e-9: 
+                for i in range(5):
+                    freq_ripple = 2 + i * 3; phase_ripple = i * np.pi / 4
+                    amplitude_ripple = np.clip(dev_mean * (1 + i * dev_std * 0.2), -0.5, 0.5) 
+                    Z += amplitude_ripple * np.sin(freq_ripple * T + phase_ripple) * np.exp(-2*R_mesh)
+            else: Z = 0.1 * np.sin(8*T) * np.exp(-3*R_mesh)
+        else: Z = 0.1 * np.sin(8*T) * np.exp(-3*R_mesh)
+            
+        X, Y = R_mesh * np.cos(T), R_mesh * np.sin(T)
+        try: 
+            ax.plot_surface(X, Y, Z, cmap='plasma', alpha=0.8, linewidth=0, antialiased=True, rcount=50, ccount=50) 
+            Z_min_val = Z.min() if Z.size > 0 else -0.1
+            if Z.shape == X.shape and Z.shape == Y.shape: 
+                 ax.contour(X, Y, Z, levels=15, cmap='cool', linewidths=1, alpha=0.6, offset=Z_min_val) 
+            for angle_val in np.linspace(0, 2*np.pi, 8, endpoint=False): 
+                ax.plot([0, np.cos(angle_val)], [0, np.sin(angle_val)], [Z_min_val, Z_min_val], color='#00FFFF', alpha=0.3, linewidth=1)
+            for radius_val_circ in np.linspace(0.2, 1.0, 5): 
+                theta_circ = np.linspace(0, 2*np.pi, 100)
+                ax.plot(radius_val_circ * np.cos(theta_circ), radius_val_circ * np.sin(theta_circ), Z_min_val, color='#BF40BF', alpha=0.3, linewidth=1)
+            ax.set_zlim(Z.min() - 0.1 if Z.size > 0 else -0.2, Z.max() + 0.1 if Z.size > 0 else 0.2) 
+        except Exception as e_surf:
+            print(f"Error in 3D ripple plot: {e_surf}")
+            ax.text(0.5, 0.5, 0.5, "Error rendering 3D surface", color="red", ha="center", va="center", transform=ax.transAxes)
+
+        ax.set_facecolor('black'); ax.grid(False)
+        ax.set_xlabel('Spatial X', color='#00FFFF'); ax.set_ylabel('Spatial Y', color='#00FFFF')
+        ax.set_zlabel('Context Ripple Amplitude', color='#BF40BF')
+        ax.set_title('HyperMorphic Spacetime Ripples', color='white', fontsize=16, pad=20)
+        ax.view_init(elev=30, azim=45)
+        ax.xaxis.pane.fill = ax.yaxis.pane.fill = ax.zaxis.pane.fill = False
+        ax.xaxis.pane.set_edgecolor('none'); ax.yaxis.pane.set_edgecolor('none'); ax.zaxis.pane.set_edgecolor('none')
+        ax.tick_params(colors='#00E5FF')
+        return fig
+
+    def run_analysis(self, event='GW150914'):
+        print(f"\n=== HyperMorphic GW Analysis: {event} ===")
+        
+        self.results = { 
+            'time': np.array([]), 'strain_h1': np.array([]), 'strain_l1': None,
+            'mode_deviations': {}, 'epsilon_count': {},
+            'freq_classical': np.array([]), 'psd_classical': np.array([]),
+            'ripple_freq': np.array([]), 'ripple_dev': np.array([]),
+            'xcorr_lags': np.array([]), 'h_xcorr': np.array([]), 'c_xcorr': np.array([])
+        }
+
+        data_h1 = self.fetch_gw_data(event, 'H1')
+        if not (isinstance(data_h1, TimeSeries) and hasattr(data_h1, 'value') and data_h1.value is not None and len(data_h1.value) > 0):
+            print(f"CRITICAL: H1 data for {event} is invalid. Plotting empty results.")
+            return self.results, self.plot_results(f"{event} - DATA FAILURE", self.results) 
+        
+        data_l1 = None
+        event_detectors = self.gw_events.get(event, {}).get('detectors', [])
+        if 'L1' in event_detectors:
+            data_l1 = self.fetch_gw_data(event, 'L1')
+            if not (isinstance(data_l1, TimeSeries) and hasattr(data_l1, 'value') and data_l1.value is not None and len(data_l1.value) > 0):
+                print(f"Warning: L1 data for {event} is invalid. Proceeding with H1 only.")
+                data_l1 = None 
+
+        final_h1_ts = data_h1
+        self.results['strain_h1'] = final_h1_ts.value
+        self.results['time'] = final_h1_ts.times.value 
+
+        if data_l1 is not None: 
+            min_len = min(len(final_h1_ts.value), len(data_l1.value))
+            self.results['strain_h1'] = final_h1_ts.value[:min_len] 
+            self.results['time'] = final_h1_ts.times.value[:min_len]    
+            self.results['strain_l1'] = data_l1.value[:min_len]
+        else: self.results['strain_l1'] = None 
+        
+        if len(self.results['strain_h1']) == 0: 
+            print("CRITICAL: Strain_h1 empty after alignment. Plotting empty results.")
+            return self.results, self.plot_results(f"{event} - DATA ALIGNMENT FAILURE", self.results)
+
+        classical_fft_full = np.fft.fft(self.results['strain_h1'])
+        freq_classical_np = np.fft.fftfreq(len(self.results['strain_h1']), 1/self.sample_rate)
+        positive_freq_indices = freq_classical_np >= 0 
+        self.results['freq_classical'] = freq_classical_np[positive_freq_indices]
+        self.results['psd_classical'] = np.abs(classical_fft_full[positive_freq_indices])**2
+        
+        fft_segment_len = min(1024, len(self.results['strain_h1']))
+        if fft_segment_len == 0: 
+            print("Warning: Strain data too short for FFT segment analysis during run_analysis.")
+            return self.results, self.plot_results(event, self.results) 
+        
+        modes = ['Aggressive', 'AdaptiveV13_Stronger', 'ClassicalMimicry']
+        global HYPERMORPHIC_MODE 
+        original_mode = HYPERMORPHIC_MODE
+
+        for mode in modes:
+            HYPERMORPHIC_MODE = mode
+            
+            h_data_segment = self.hypermorphic_transform(self.results['strain_h1'][:fft_segment_len], dimension=0)
+            self.results['epsilon_count'][mode] = sum(1 for h in h_data_segment if h.is_epsilon)
+            h_fft_out = self.hypermorphic_fft(h_data_segment) 
+            
+            classical_fft_seg_for_ripples_current_mode = np.fft.fft(self.results['strain_h1'][:len(h_data_segment)])[:len(h_data_segment)//2]
+            ripple_freq, ripple_dev = self.detect_context_ripples(h_fft_out, classical_fft_seg_for_ripples_current_mode)
+
+            if mode == original_mode: 
+                self.results['ripple_freq'] = ripple_freq
+                self.results['ripple_dev'] = ripple_dev
+            self.results['mode_deviations'][mode] = ripple_dev
+
+        HYPERMORPHIC_MODE = original_mode 
+
+        if self.results['strain_l1'] is not None:
+            seg_len_xcorr = min(1024, len(self.results['strain_h1']), len(self.results['strain_l1']))
+            if seg_len_xcorr > 0:
+                h_xcorr, c_xcorr, xcorr_lags = self.analyze_hypermorphic_signature(
+                    self.results['strain_h1'][:seg_len_xcorr], self.results['strain_l1'][:seg_len_xcorr]
+                )
+                self.results['h_xcorr']=h_xcorr; self.results['c_xcorr']=c_xcorr; self.results['xcorr_lags']=xcorr_lags
+        
+        print(f"\n=== Base Analysis Summary for {event} Completed ===")
+        fig = self.plot_results(event, self.results) 
+        return self.results, fig
+
+# --- 1. Epsilon Sensitivity Sweeper ---
+class EpsilonSensitivitySweeper:
+    def __init__(self, analyzer_instance):
+        self.analyzer = analyzer_instance
+        self.original_epsilon_phi_value = None 
+
+    def sweep_epsilon(self, data_ts_input, epsilon_values, dimension=0): 
+        global EPSILON_PHI_VALUE 
+        self.original_epsilon_phi_value = EPSILON_PHI_VALUE 
+        
+        sweep_results_dict = {}
+        if not isinstance(data_ts_input, TimeSeries) or not hasattr(data_ts_input, 'value') or data_ts_input.value is None:
+            if self.original_epsilon_phi_value is not None: EPSILON_PHI_VALUE = self.original_epsilon_phi_value 
+            return sweep_results_dict
+
+        data_raw_values = data_ts_input.value
+        fft_segment_len = min(1024, len(data_raw_values)) 
+        if fft_segment_len == 0:
+            if self.original_epsilon_phi_value is not None: EPSILON_PHI_VALUE = self.original_epsilon_phi_value 
+            return sweep_results_dict
+
+        for eps_val in epsilon_values:
+            EPSILON_PHI_VALUE = eps_val 
+            h_data_segment = self.analyzer.hypermorphic_transform(data_raw_values[:fft_segment_len], dimension)
+            h_fft_segment = self.analyzer.hypermorphic_fft(h_data_segment)
+            classical_fft_for_ripples = np.fft.fft(data_raw_values[:fft_segment_len])[:len(h_data_segment)//2] 
+            
+            _, ripple_dev = self.analyzer.detect_context_ripples(h_fft_segment, classical_fft_for_ripples)
+            
+            mean_val, max_val = 0,0
+            if ripple_dev is not None and len(ripple_dev) > 0 :
+                finite_r = ripple_dev[np.isfinite(ripple_dev)]
+                if len(finite_r)>0: mean_val, max_val = np.mean(finite_r), np.max(finite_r)
+            sweep_results_dict[eps_val] = {'epsilon_occurrences': sum(1 for h in h_data_segment if h.is_epsilon),
+                                           'mean_ripple_deviation': mean_val, 'max_ripple_deviation': max_val}
+        
+        if self.original_epsilon_phi_value is not None: EPSILON_PHI_VALUE = self.original_epsilon_phi_value 
+        return sweep_results_dict
+
+    def plot_sweep_results(self, sweep_results_dict, event_name): 
+        if not sweep_results_dict: 
+            fig, ax = plt.subplots(1,1, facecolor='black')
+            ax.text(0.5,0.5, "No sweep results to plot.", color='gray', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'ε_H Sensitivity Sweep for {event_name} - No Data', color='#BF40BF'); return fig
+
+        eps_values = sorted(list(sweep_results_dict.keys()))
+        plot_data_map = {
+            'Epsilon Occurrences': ([sweep_results_dict[ev]['epsilon_occurrences'] for ev in eps_values], 'Epsilon Identification vs. ε_H'),
+            'Mean Ripple Dev.': ([sweep_results_dict[ev]['mean_ripple_deviation'] for ev in eps_values], 'Mean Ripple Magnitude vs. ε_H'),
+            'Max Ripple Dev.': ([sweep_results_dict[ev]['max_ripple_deviation'] for ev in eps_values], 'Max Ripple Magnitude vs. ε_H')
+        }
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True, facecolor='black')
+        fig.suptitle(f'ε_H Sensitivity Sweep for {event_name}', fontsize=16, color='#BF40BF', y=0.98)
+        common_style = {'marker': 'o', 'linestyle': '-'}; colors = ['#00FFFF', '#FF10F0', '#ADFF2F'] 
+        
+        for i, (ylabel, (data_series, title_suffix)) in enumerate(plot_data_map.items()):
+            ax = axes[i]
+            ax.plot(eps_values, data_series, **common_style, color=colors[i], label=ylabel)
+            ax.set_ylabel(ylabel, color=colors[i]); ax.set_title(title_suffix, color='#BF40BF'); ax.set_yscale('log')
+            ax.set_facecolor('black'); ax.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':')
+            for spine in ax.spines.values(): spine.set_color('#BF40BF')
+            ax.tick_params(colors=colors[i % len(colors)], axis='y'); ax.tick_params(colors='#00E5FF', axis='x')
+            if any(val > 0 for val in data_series if isinstance(val, (int,float)) and np.isfinite(val)):
+                 ax.legend(facecolor='black', edgecolor='#BF40BF', labelcolor='white')
+            if i < 2: ax.tick_params(labelbottom=False)
+        axes[2].set_xlabel('ε_H Threshold Value', color='#00FFFF'); axes[2].set_xscale('log')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+# --- 2. HyperMorphic Wave Interference Engine ---
+class WaveInterferenceEngine:
+    def __init__(self, analyzer_instance): self.analyzer = analyzer_instance
+
+    def combine_waveforms_hnum(self, h_data_list, base_dimension=0):
+        if not h_data_list or not all(isinstance(hd, list) and len(hd) > 0 for hd in h_data_list): return []
+        min_len = min(len(hd) for hd in h_data_list)
+        combined_h_data = []
+        for i in range(min_len):
+            current_sum_h = HNum(0, base_dimension + (i % 10)) 
+            for h_series_idx, h_series in enumerate(h_data_list):
+                current_sum_h = current_sum_h.add(h_series[i], op_ctx=f"interfere_s{h_series_idx}_t{i}")
+            combined_h_data.append(current_sum_h)
+        return combined_h_data
+
+    def analyze_interference(self, list_of_timeseries, fft_segment_len=1024):
+        empty_res = {'original_waveforms_ts': list_of_timeseries, 'classical_combined_signal_raw': np.array([]), 
+                     'h_combined_data_real': [], 'ripple_freq_combined': np.array([]), 
+                     'ripple_dev_combined': np.array([]), 'sample_rate': self.analyzer.sample_rate}
+        if not list_of_timeseries or not all(isinstance(ts, TimeSeries) and hasattr(ts, 'value') and ts.value is not None for ts in list_of_timeseries):
+            return empty_res
+
+        valid_ts_values = [ts.value for ts in list_of_timeseries if ts.value is not None and len(ts.value) > 0]
+        if not valid_ts_values: return empty_res
+        min_overall_len = min(len(v) for v in valid_ts_values)
+        if min_overall_len == 0: return empty_res
+        fft_segment_len = min(fft_segment_len, min_overall_len)
+        if fft_segment_len == 0: return empty_res
+
+        h_data_list_transformed = []; classical_signals_raw = []
+        for i, ts_data in enumerate(list_of_timeseries):
+            if ts_data.value is not None and len(ts_data.value) >= min_overall_len:
+                h_data_list_transformed.append(self.analyzer.hypermorphic_transform(ts_data.value[:min_overall_len], dimension=i*10))
+                classical_signals_raw.append(ts_data.value[:min_overall_len])
+        
+        if not classical_signals_raw or not h_data_list_transformed or not all(h_data_list_transformed): return empty_res
+
+        classical_combined_signal_raw = np.sum(np.array(classical_signals_raw), axis=0)
+        h_combined_data = self.combine_waveforms_hnum(h_data_list_transformed, base_dimension=100) 
+        
+        h_fft_combined_seg = self.analyzer.hypermorphic_fft(h_combined_data[:fft_segment_len])
+        classical_fft_combined_seg = np.fft.fft(classical_combined_signal_raw[:fft_segment_len])[:len(h_combined_data[:fft_segment_len])//2]
+        
+        ripple_freq_comb, ripple_dev_comb = self.analyzer.detect_context_ripples(h_fft_combined_seg, classical_fft_combined_seg)
+        
+        return {**empty_res, 'original_waveforms_ts': list_of_timeseries, 'classical_combined_signal_raw': classical_combined_signal_raw,
+                'h_combined_data_real': [h.value.real for h in h_combined_data if hasattr(h,'value')], 
+                'ripple_freq_combined': ripple_freq_comb, 'ripple_dev_combined': ripple_dev_comb}
+
+    def plot_interference_results(self, results, event_name_prefix):
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(2, 2, figsize=(17, 11), facecolor='black')
+        fig.suptitle(f'HyperMorphic Wave Interference: {event_name_prefix}', fontsize=16, color='#BF40BF', y=0.98)
+        
+        classical_combined = results.get('classical_combined_signal_raw', np.array([]))
+        sample_rate = results.get('sample_rate', self.analyzer.sample_rate)
+
+        if len(classical_combined) == 0 or sample_rate == 0 : 
+            for ax_row in axes: 
+                for ax_item in ax_row: ax_item.text(0.5,0.5, "No data.", color='gray', ha='center', va='center', transform=ax_item.transAxes)
+            plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+        time_vector = np.arange(len(classical_combined)) / sample_rate
+        colors = ['#00FFFF', '#FF10F0', '#ADFF2F', '#FFA500'] 
+
+        ax = axes[0,0]; ax.set_title('Classical Waveforms (Individual & Sum)', color='#BF40BF')
+        for i, ts_data in enumerate(results.get('original_waveforms_ts',[])):
+            if ts_data.value is not None and len(ts_data.value) >= len(time_vector):
+                 ax.plot(time_vector, ts_data.value[:len(time_vector)], label=f'Wave {i+1}', color=colors[i % len(colors)], alpha=0.6, lw=1)
+        ax.plot(time_vector, classical_combined[:len(time_vector)], label='Classical Sum', color='white', linewidth=1.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Strain'); ax.legend()
+
+        ax = axes[0,1]; ax.set_title('HyperMorphic Combined Waveform (Real Part)', color='#BF40BF')
+        h_combined_real = results.get('h_combined_data_real',[])
+        if h_combined_real: ax.plot(time_vector[:len(h_combined_real)], h_combined_real, label='H-Combined (Real)', color='#BF40BF', lw=1.5)
+        else: ax.text(0.5,0.5, "No H-data.", color='gray', ha='center', va='center', transform=ax.transAxes)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('H-Strain (Real)'); ax.legend()
+
+        ax = axes[1,0]; ax.set_title('Context Ripples of Combined Signal', color='#BF40BF')
+        rfc, rdc = results.get('ripple_freq_combined'), results.get('ripple_dev_combined')
+        if rfc is not None and len(rfc) > 0 and rdc is not None and len(rdc) == len(rfc):
+            ax.scatter(rfc, rdc, color=colors[1], s=15, alpha=0.7, label='Combined Ripples', edgecolors='w', linewidths=0.3)
+            ax.set_yscale('log'); ax.legend()
+        else: ax.text(0.5,0.5, "No ripple data.", color='gray', ha='center', va='center', transform=ax.transAxes)
+
+        ax = axes[1,1]; ax.set_title('Context Bloom (Conceptual)', color='#BF40BF')
+        if rfc is not None and len(rfc) > 0 and rdc is not None and len(rdc) == len(rfc):
+            valid_ripples = rdc[np.isfinite(rdc)]
+            if len(valid_ripples) > 0:
+                strong_mask = rdc > np.percentile(valid_ripples, 90) 
+                ax.scatter(rfc[strong_mask], rdc[strong_mask], color=colors[2], s=20, label='Strong Ripple Points (Bloom?)', marker='*')
+                ax.set_yscale('log'); ax.legend()
+            else: ax.text(0.5,0.5, "No valid ripple data for bloom.", color='gray', ha='center', va='center', transform=ax.transAxes)
+        else: ax.text(0.5,0.5, "Ripple data missing for bloom.", color='gray', ha='center', va='center', transform=ax.transAxes)
+        
+        for r_ax_row in axes: 
+            for c_ax in r_ax_row:
+                c_ax.set_facecolor('black'); c_ax.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':'); 
+                for spine in c_ax.spines.values(): spine.set_color('#BF40BF')
+                c_ax.tick_params(colors='#00E5FF'); c_ax.xaxis.label.set_color('#00FFFF'); c_ax.yaxis.label.set_color('#00FFFF')
+                handles, labels = c_ax.get_legend_handles_labels()
+                if labels: c_ax.legend(handles, labels, facecolor='black', edgecolor='#BF40BF', labelcolor='white')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+# --- 3. Entanglement Context Injection (Gate Drift Engine) ---
+_original_phi_dynamic_base = phi_dynamic_base
+_original_psi_dynamic_modulus = psi_dynamic_modulus
+
+class GateDriftEngine: 
+    def __init__(self, analyzer_instance):
+        self.analyzer = analyzer_instance; self.drift_active = False
+        self.phi_drift_amplitude = 0; self.psi_drift_amplitude = 0
+        self.phi_drift_freq = 0.1 ; self.psi_drift_freq = 0.1
+
+    def _phi_dynamic_base_drifted(self, dim, mag, op_ctx): 
+        orig = _original_phi_dynamic_base(dim, mag, op_ctx)
+        drift = self.phi_drift_amplitude * np.sin(self.phi_drift_freq * mag + dim * 0.1)
+        return max(1, int(np.round(orig + drift)))
+
+    def _psi_dynamic_modulus_drifted(self, dim, mag, op_ctx): 
+        orig = _original_psi_dynamic_modulus(dim, mag, op_ctx)
+        drift = self.psi_drift_amplitude * np.cos(self.psi_drift_freq * mag + dim * 0.1)
+        return max(1, int(np.round(orig + drift)))
+
+    def activate_drift(self, p_amp, ps_amp, p_freq=0.1, ps_freq=0.1): 
+        global phi_dynamic_base, psi_dynamic_modulus
+        self.phi_drift_amplitude = p_amp; self.psi_drift_amplitude = ps_amp
+        self.phi_drift_freq = p_freq; self.psi_drift_freq = ps_freq
+        phi_dynamic_base = self._phi_dynamic_base_drifted
+        psi_dynamic_modulus = self._psi_dynamic_modulus_drifted
+        self.drift_active = True
+
+    def deactivate_drift(self):
+        global phi_dynamic_base, psi_dynamic_modulus
+        phi_dynamic_base = _original_phi_dynamic_base
+        psi_dynamic_modulus = _original_psi_dynamic_modulus
+        self.drift_active = False
+
+    def analyze_with_drift(self, data_ts_in, p_amp, ps_amp, p_freq=0.1, ps_freq=0.1, fft_len=1024): 
+        empty_res = {'h_data_drifted_real_segment': [], 'ripple_freq_drift': np.array([]), 
+                     'ripple_dev_drift': np.array([]), 'phi_params': (0,0), 'psi_params':(0,0), 'sample_rate':0}
+        if not isinstance(data_ts_in, TimeSeries) or not hasattr(data_ts_in, 'value') or data_ts_in.value is None:
+            return empty_res
+        self.activate_drift(p_amp, ps_amp, p_freq, ps_freq)
+        raw_vals = data_ts_in.value
+        fft_len = min(fft_len, len(raw_vals))
+        if fft_len == 0: self.deactivate_drift(); return {**empty_res, 'phi_params':(p_amp,p_freq), 'psi_params':(ps_amp,ps_freq), 
+                                                           'sample_rate':getattr(data_ts_in.sample_rate,'value',0)}
+        
+        seg_raw = raw_vals[:fft_len]
+        h_data_drifted = self.analyzer.hypermorphic_transform(seg_raw, dimension=0) 
+        h_fft_drifted = self.analyzer.hypermorphic_fft(h_data_drifted)
+        classical_fft = np.fft.fft(seg_raw)[:len(h_data_drifted)//2] 
+        rf_drift, rd_drift = self.analyzer.detect_context_ripples(h_fft_drifted, classical_fft)
+        self.deactivate_drift() 
+        
+        return {'h_data_drifted_real_segment': [h.value.real for h in h_data_drifted if hasattr(h,'value')],
+                'ripple_freq_drift': rf_drift, 'ripple_dev_drift': rd_drift,
+                'phi_params': (p_amp, p_freq), 'psi_params': (ps_amp, ps_freq),
+                'sample_rate': getattr(data_ts_in.sample_rate,'value', self.analyzer.sample_rate)}
+
+    def plot_drift_results(self, drift_res, base_res_seg, event_name): 
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(1, 2, figsize=(17, 7), facecolor='black')
+        phi_A, psi_A = drift_res.get('phi_params', (0,))[0], drift_res.get('psi_params', (0,))[0]
+        fig.suptitle(f'Gate Drift: {event_name} (φ_A={phi_A}, ψ_A={psi_A})', fontsize=16, color='#BF40BF', y=0.98)
+
+        h_data_drifted = drift_res.get('h_data_drifted_real_segment', [])
+        if not h_data_drifted:
+            for ax_item in axes: ax_item.text(0.5,0.5, "No drift data", color='gray', ha='center', va='center', transform=ax_item.transAxes)
+            plt.tight_layout(rect=[0,0,1,0.95]); return fig
+
+        sr = drift_res.get('sample_rate', self.analyzer.sample_rate)
+        time_vec = np.arange(len(h_data_drifted)) / sr if sr > 0 else np.arange(len(h_data_drifted))
+
+        ax = axes[0]; ax.set_title('Waveform Deformation (Segment)', color='#BF40BF')
+        base_h = base_res_seg.get('h_data_real_segment', [])
+        if base_h: ax.plot(time_vec[:min(len(time_vec), len(base_h))], base_h[:min(len(time_vec), len(base_h))], label='Base H (Real)', color='#00FFFF', alpha=0.7, lw=1)
+        ax.plot(time_vec, h_data_drifted, label='Drifted H (Real)', color='#FF10F0', linestyle='--', lw=1.2)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('H-Strain (Real)'); ax.legend()
+
+        ax = axes[1]; ax.set_title('Context Ripple Changes', color='#BF40BF')
+        base_rf, base_rd = base_res_seg.get('ripple_freq'), base_res_seg.get('ripple_dev')
+        if base_rf is not None and len(base_rf) > 0 and base_rd is not None and len(base_rd) == len(base_rf):
+             ax.plot(base_rf, base_rd, label='Base Ripples', color='#00FFFF', alpha=0.7, lw=1)
+        
+        drift_rf, drift_rd = drift_res.get('ripple_freq_drift'), drift_res.get('ripple_dev_drift')
+        if drift_rf is not None and len(drift_rf) > 0 and drift_rd is not None and len(drift_rd) == len(drift_rf):
+            ax.plot(drift_rf, drift_rd, label='Drifted Ripples', color='#FF10F0', linestyle='--', lw=1.2)
+        ax.set_xlabel('Frequency (Hz)'); ax.set_ylabel('Rel. Deviation'); ax.set_yscale('log'); ax.legend()
+        
+        for c_ax in axes: 
+            c_ax.set_facecolor('black'); c_ax.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':');
+            for spine in c_ax.spines.values(): spine.set_color('#BF40BF')
+            c_ax.tick_params(colors='#00E5FF'); c_ax.xaxis.label.set_color('#00FFFF'); c_ax.yaxis.label.set_color('#00FFFF')
+            handles, labels = c_ax.get_legend_handles_labels()
+            if labels: c_ax.legend(handles,labels,facecolor='black', edgecolor='#BF40BF', labelcolor='white')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+# --- 4. Synthetic Source Engine ---
+class SyntheticSourceEngine:
+    def __init__(self, analyzer_instance): self.analyzer = analyzer_instance
+
+    def generate_non_gr_waveform(self, dur, sr, params=None): 
+        if params is None: params = {}
+        t = np.arange(0, dur, 1/sr) if sr > 0 else np.array([])
+        if len(t) == 0: return TimeSeries(np.array([]), sample_rate=sr, t0=0, name='Empty_NonGR')
+
+        f0, f1_target = params.get('f0', 30), params.get('f1', 300) 
+        evol_factor = params.get('mass_evol_factor', 0.2) 
+        freq_t = f0 + (f1_target - f0) * np.power(t / dur if dur > 0 else t, 1 + evol_factor) 
+        phase = 2 * np.pi * np.cumsum(freq_t) / sr 
+        amp_base = 1e-21 * (1 + 5 * (t / dur if dur > 0 else t)) 
+
+        for start_f, end_f, val_factor in params.get('epsilon_fractures', []):
+            s_idx, e_idx = int(start_f * len(t)), int(end_f * len(t))
+            if e_idx > s_idx: 
+                if val_factor == "EPSILON": amp_base[s_idx:e_idx] = EPSILON_PHI_VALUE 
+                else: amp_base[s_idx:e_idx] *= val_factor 
+        strain = amp_base * np.sin(phase)
+        for time_f, b_f, b_dur_f, b_amp_f in params.get('burst_freqs',[]):
+            s_idx, e_idx = int(time_f*len(t)), min(int((time_f+b_dur_f)*len(t)), len(t))
+            if e_idx > s_idx: 
+                burst_t = np.arange(0, (e_idx-s_idx)/sr, 1/sr)
+                if len(burst_t) > 0:
+                     amp = b_amp_f * (amp_base.mean() if amp_base.size>0 else 1e-22)
+                     sig = amp * np.sin(2*np.pi*b_f*burst_t) * (np.sin(np.pi*np.arange(len(burst_t))/len(burst_t))**2) 
+                     strain[s_idx:e_idx] += sig[:min(len(sig), len(strain[s_idx:e_idx]))]
+        return TimeSeries(strain, sample_rate=sr, t0=0, name='NonGR_Synth')
+
+    def analyze_synthetic_source(self, non_gr_ts, hm_params=None, fft_len=1024): 
+        empty_res = {'non_gr_waveform_ts': non_gr_ts, 'h_data_real_segment': [], 
+                     'ripple_freq_non_gr': np.array([]), 'ripple_dev_non_gr': np.array([])}
+        if hm_params is None: hm_params = {}
+        if not isinstance(non_gr_ts, TimeSeries) or not hasattr(non_gr_ts, 'value') or non_gr_ts.value is None: return empty_res
+        
+        raw_vals = non_gr_ts.value
+        fft_len = min(fft_len, len(raw_vals))
+        if fft_len == 0: return empty_res
+
+        seg_raw = raw_vals[:fft_len]
+        h_data = self.analyzer.hypermorphic_transform(seg_raw, dimension=hm_params.get('hm_dim',77)) 
+        h_fft = self.analyzer.hypermorphic_fft(h_data)
+        classical_fft = np.fft.fft(seg_raw)[:len(h_data)//2] 
+        rf, rd = self.analyzer.detect_context_ripples(h_fft, classical_fft)
+        
+        return {'non_gr_waveform_ts': non_gr_ts, 'h_data_real_segment': [h.value.real for h in h_data if hasattr(h,'value')],
+                'ripple_freq_non_gr': rf, 'ripple_dev_non_gr': rd}
+
+    def plot_synthetic_results(self, synth_res, source_name): 
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(1, 2, figsize=(17, 7), facecolor='black')
+        fig.suptitle(f'Synthetic Non-GR Source: {source_name}', fontsize=16, color='#BF40BF',y=0.98)
+
+        ts_data = synth_res.get('non_gr_waveform_ts')
+        if not (isinstance(ts_data, TimeSeries) and hasattr(ts_data,'times') and ts_data.times is not None and 
+                hasattr(ts_data,'value') and ts_data.value is not None and len(ts_data.value) > 0):
+             for ax_item in axes: ax_item.text(0.5,0.5, "No data", color='gray', ha='center', va='center', transform=ax_item.transAxes)
+             plt.tight_layout(rect=[0,0,1,0.95]); return fig
+
+        time_vec = ts_data.times.value
+        ax = axes[0]; ax.set_title('Generated Non-GR Waveform (Classical)', color='#BF40BF')
+        ax.plot(time_vec, ts_data.value, color='#00FFFF', lw=1)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Strain')
+
+        ax = axes[1]; ax.set_title('Context Ripples of Non-GR Waveform', color='#BF40BF')
+        rf, rd = synth_res.get('ripple_freq_non_gr'), synth_res.get('ripple_dev_non_gr')
+        if rf is not None and len(rf) > 0 and rd is not None and len(rd) == len(rf):
+            ax.scatter(rf, rd, color='#FF10F0', s=15, alpha=0.7, label='Non-GR Ripples', edgecolors='w', lw=0.3)
+            ax.set_yscale('log'); ax.legend()
+        else: ax.text(0.5,0.5, "No ripple data", color='gray', ha='center', va='center', transform=ax.transAxes)
+        
+        for c_ax in axes: 
+            c_ax.set_facecolor('black'); c_ax.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':');
+            for spine in c_ax.spines.values(): spine.set_color('#BF40BF')
+            c_ax.tick_params(colors='#00E5FF'); c_ax.xaxis.label.set_color('#00FFFF'); c_ax.yaxis.label.set_color('#00FFFF')
+            handles, labels = c_ax.get_legend_handles_labels()
+            if labels: c_ax.legend(handles,labels,facecolor='black', edgecolor='#BF40BF', labelcolor='white')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+# --- 5. Dynamic Ripple Resonance Tracker ---
+class DynamicRippleTracker:
+    def __init__(self, analyzer_instance): self.analyzer = analyzer_instance
+
+    def _hypermorphic_stft_manual(self, h_data_full, win_size, ovlp, dim_base=0): 
+        step = win_size - ovlp
+        if step <= 0: 
+            print("Error: STFT step size is zero or negative. Check window_size and overlap.")
+            return []
+        num_segments = (len(h_data_full) - ovlp) // step 
+        h_stft_vals = [] 
+        if num_segments <= 0: return []
+        for i in range(num_segments):
+            start = i * step
+            end = start + win_size 
+            if end > len(h_data_full): break 
+            segment_h_data = h_data_full[start:end]
+            h_fft_segment = self.analyzer.hypermorphic_fft(segment_h_data) 
+            h_stft_vals.append(h_fft_segment)
+        return h_stft_vals
+
+    def track_dynamic_ripples(self, data_ts_in, win_size=256, ovlp_ratio=0.5): 
+        empty_res = {'t': np.array([]), 'f': np.array([]), 'ripple_spectrogram': np.array([[]]), 'h_stft_phases': None}
+        if not (isinstance(data_ts_in, TimeSeries) and hasattr(data_ts_in, 'value') and 
+                data_ts_in.value is not None and len(data_ts_in.value) >= win_size) :
+            data_len = len(data_ts_in.value) if (isinstance(data_ts_in, TimeSeries) and hasattr(data_ts_in, 'value') and data_ts_in.value is not None) else 0
+            print(f"Error: Invalid/short timeseries for dynamic ripples (len: {data_len}, win: {win_size})."); return empty_res
+
+        ovlp = int(win_size * ovlp_ratio)
+        raw_vals = data_ts_in.value
+        h_data_full = self.analyzer.hypermorphic_transform(raw_vals, dimension=0) 
+        h_stft_ffts_hnum = self._hypermorphic_stft_manual(h_data_full, win_size, ovlp) 
+        if not h_stft_ffts_hnum: print("H-STFT no segments."); return empty_res
+
+        sr_val = getattr(data_ts_in.sample_rate,'value', self.analyzer.sample_rate)
+        f_c, t_c, Zxx_c = stft(raw_vals, fs=sr_val, window='hann', nperseg=win_size, noverlap=ovlp) 
+        
+        n_seg_h, n_seg_c = len(h_stft_ffts_hnum), Zxx_c.shape[1]
+        actual_n_seg = min(n_seg_h, n_seg_c)
+        if actual_n_seg == 0: print("No common STFT segments."); return empty_res
+
+        n_freq_h = len(h_stft_ffts_hnum[0]) if actual_n_seg > 0 and h_stft_ffts_hnum[0] else 0
+        n_freq_c = Zxx_c.shape[0]
+        actual_n_freq = min(n_freq_h, n_freq_c)
+        if actual_n_freq == 0: print("No common STFT freqs."); return {**empty_res, 't': t_c[:actual_n_seg], 'f': f_c[:actual_n_freq]}
+
+        ripple_spec = np.full((actual_n_freq, actual_n_seg), np.nan)
+        h_stft_phases_rad = np.full((actual_n_freq, actual_n_seg), np.nan) 
+
+        for seg_idx in range(actual_n_seg):
+            h_fft_seg = h_stft_ffts_hnum[seg_idx] 
+            c_fft_seg = Zxx_c[:, seg_idx]  
+            for k_f_bin in range(actual_n_freq):
+                if k_f_bin < len(h_fft_seg) and hasattr(h_fft_seg[k_f_bin],'value'): 
+                    h_val_complex = h_fft_seg[k_f_bin].value
+                    h_stft_phases_rad[k_f_bin, seg_idx] = np.angle(h_val_complex) 
+                    c_val_complex = c_fft_seg[k_f_bin] 
+                    h_abs = abs(h_val_complex); c_abs = abs(c_val_complex)
+                    if c_abs > 1e-30: ripple_spec[k_f_bin, seg_idx] = abs(h_abs - c_abs) / c_abs
+        
+        return {'t': t_c[:actual_n_seg], 'f': f_c[:actual_n_freq], 
+                'ripple_spectrogram': ripple_spec, 'h_stft_phases': h_stft_phases_rad}
+
+
+    def plot_dynamic_ripple_results(self, dyn_res, event_name): 
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(1, 1, figsize=(13, 8), facecolor='black')
+        fig.suptitle(f'Dynamic Ripple Tracker: {event_name}', fontsize=16, color='#BF40BF', y=0.98)
+        ax.set_title('Context Ripple Spectrogram (Log10 Deviation)', color='#BF40BF')
+        
+        t_p, f_p, Sxx_p = dyn_res.get('t',[]), dyn_res.get('f',[]), dyn_res.get('ripple_spectrogram', np.array([[]]))
+
+        if not isinstance(Sxx_p, np.ndarray) or Sxx_p.size==0 or Sxx_p.shape[0]==0 or Sxx_p.shape[1]==0 or len(t_p)==0 or len(f_p)==0:
+            ax.text(0.5,0.5, "No data for spectrogram.", color='gray', ha='center',va='center',transform=ax.transAxes)
+        else:
+            Sxx_plot = np.nan_to_num(Sxx_p, nan=0.0) 
+            log_Sxx = np.log10(np.clip(Sxx_plot, 1e-10, None) + 1e-20) 
+            finite_Sxx = log_Sxx[np.isfinite(log_Sxx)]
+            vm, vM = (np.percentile(finite_Sxx, 5) if finite_Sxx.size>0 else -5), (np.percentile(finite_Sxx, 99) if finite_Sxx.size>0 else 0)
+            if vm >= vM and finite_Sxx.size > 0 : vM = vm + 1 
+            elif vm >= vM : vm, vM = -5, 0 
+
+            pcm = ax.pcolormesh(t_p, f_p, log_Sxx, shading='gouraud', cmap='viridis', vmin=vm, vmax=vM) 
+            cb = fig.colorbar(pcm, ax=ax, label='Log10(Rel. Dev.)', pad=0.01, aspect=30)
+            cb.ax.yaxis.set_tick_params(color='#00E5FF'); cb.set_label('Log10(Rel. Dev.)', color='#00FFFF'); cb.outline.set_edgecolor('#BF40BF')
+
+        ax.set_ylabel('Frequency (Hz)'); ax.set_xlabel('Time (s)')
+        ax.set_facecolor('black'); ax.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':');
+        for spine in ax.spines.values(): spine.set_color('#BF40BF')
+        ax.tick_params(colors='#00E5FF'); ax.xaxis.label.set_color('#00FFFF'); ax.yaxis.label.set_color('#00FFFF')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+# --- Optional Feature Analyzer ---
+class OptionalFeatureAnalyzer:
+    def __init__(self, analyzer_instance):
+        self.analyzer = analyzer_instance
+        self.cmb_data = None 
+
+    def _generate_mock_cmb_data(self, size=(100, 200)):
+        """Generates mock CMB anisotropy data for demonstration."""
+        cmb = np.random.normal(0, 1, size) 
+        for _ in range(5):
+            cmb += np.random.normal(0, 5) * signal.windows.gaussian(size[0], size[0]//10)[:, np.newaxis] * \
+                   signal.windows.gaussian(size[1], size[1]//10)[np.newaxis, :]
+        cmb = gaussian_filter(cmb, sigma=2)
+        self.cmb_data = cmb
+        return cmb
+
+    def analyze_cmb_overlay(self, h_ripple_map_freqs, h_ripple_map_devs):
+        if self.cmb_data is None: self.cmb_data = self._generate_mock_cmb_data()
+        resonance_map = np.zeros_like(self.cmb_data)
+        if h_ripple_map_freqs is not None and h_ripple_map_devs is not None and \
+           len(h_ripple_map_freqs) > 0 and len(h_ripple_map_devs) == len(h_ripple_map_freqs):
+            
+            valid_devs_for_percentile = h_ripple_map_devs[np.isfinite(h_ripple_map_devs)]
+            strong_ripple_threshold = np.percentile(valid_devs_for_percentile, 80) if len(valid_devs_for_percentile) > 0 else 0.1
+            
+            finite_freqs = h_ripple_map_freqs[np.isfinite(h_ripple_map_freqs)]
+            if len(finite_freqs) == 0: return self.cmb_data, resonance_map
+            min_f, max_f = finite_freqs.min(), finite_freqs.max()
+
+            if max_f > min_f:
+                valid_indices = np.isfinite(h_ripple_map_freqs) & np.isfinite(h_ripple_map_devs)
+                valid_freqs, valid_devs = h_ripple_map_freqs[valid_indices], h_ripple_map_devs[valid_indices]
+                if len(valid_freqs) == 0: return self.cmb_data, resonance_map
+
+                norm_freqs = (valid_freqs - min_f) / (max_f - min_f)
+                y_indices = (norm_freqs * (self.cmb_data.shape[0] - 1)).astype(int)
+                for idx, dev in zip(y_indices, valid_devs):
+                    if dev > strong_ripple_threshold: resonance_map[idx, :] += dev 
+            elif len(h_ripple_map_freqs) > 0 and np.isfinite(h_ripple_map_devs[0]) and h_ripple_map_devs[0] > strong_ripple_threshold :
+                resonance_map[self.cmb_data.shape[0] // 2, :] += h_ripple_map_devs[0]
+        return self.cmb_data, resonance_map
+
+    def plot_cmb_overlay(self, cmb_data, resonance_map, event_name):
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(1, 1, figsize=(10, 7), facecolor='black')
+        fig.suptitle(f'CMB Ripple Overlay (Conceptual) for {event_name}', fontsize=16, color='#BF40BF', y=0.98)
+
+        if cmb_data is not None:
+            ax.imshow(cmb_data, cmap='coolwarm', aspect='auto', origin='lower')
+            if resonance_map is not None and resonance_map.shape == cmb_data.shape:
+                vmax_res = resonance_map.max(); vmax_res = 1 if vmax_res == 0 else vmax_res
+                ax.imshow(resonance_map, cmap='viridis', alpha=0.5, aspect='auto', origin='lower', vmax=vmax_res)
+        else: ax.text(0.5,0.5, "CMB data not available.", color='gray', ha='center', va='center',transform=ax.transAxes)
+
+        ax.set_title('Mock CMB Anisotropies with HyperMorphic Ripple Resonance Bands', color='#BF40BF')
+        ax.set_xlabel('Simulated Sky Patch X (pixels)'); ax.set_ylabel('Simulated Sky Patch Y / Ripple Frequency Band')
+        ax.set_facecolor('black'); ax.grid(False); 
+        for spine in ax.spines.values(): spine.set_color('#BF40BF')
+        ax.tick_params(colors='#00E5FF'); ax.xaxis.label.set_color('#00FFFF'); ax.yaxis.label.set_color('#00FFFF')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+    def generate_solar_system_pulse(self, duration_s, event_time_frac=0.5, strength=1e-23):
+        num_samples = int(duration_s * self.analyzer.sample_rate)
+        if num_samples <=0: return TimeSeries(np.array([]), sample_rate=self.analyzer.sample_rate, name="EmptySolarPulse")
+        t = np.linspace(0, duration_s, num_samples, endpoint=False)
+        pulse = strength * np.exp(-((t - duration_s * event_time_frac)**2) / (2 * (duration_s * 0.1 / 3)**2)) 
+        return TimeSeries(pulse, sample_rate=self.analyzer.sample_rate, name="SolarPulse")
+
+    def analyze_zeno_layer(self, data_ts, ripple_devs, ripple_freqs, epsilon_threshold):
+        zeno_map = np.zeros_like(data_ts.value) 
+        if ripple_devs is not None and ripple_freqs is not None and \
+           len(ripple_devs) > 0 and len(ripple_freqs) == len(ripple_devs):
+            near_epsilon_mask = (ripple_devs > 0.1 * epsilon_threshold) & (ripple_devs < epsilon_threshold) 
+            num_near_epsilon_freqs = np.sum(near_epsilon_mask)
+            if len(ripple_freqs) > 0 and (num_near_epsilon_freqs / len(ripple_freqs)) > 0.05:
+                analytic_signal = signal.hilbert(data_ts.value)
+                envelope = np.abs(analytic_signal)
+                smoothed_envelope = gaussian_filter(envelope, sigma=len(data_ts.value)//100 if len(data_ts.value) > 100 else 1)
+                zeno_map = smoothed_envelope * 0.3 
+        return zeno_map 
+
+    def plot_zeno_layer_results(self, data_ts, zeno_suppression_effect, event_name): 
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6), facecolor='black')
+        fig.suptitle(f'Zeno Layer Analysis (Conceptual) for {event_name}', fontsize=16, color='#BF40BF', y=0.98)
+
+        time_vector = data_ts.times.value
+        if len(time_vector) > 0 and len(data_ts.value) == len(time_vector):
+            ax.plot(time_vector, data_ts.value, label='Original Strain', color='#00FFFF', alpha=0.8, zorder=5)
+            if zeno_suppression_effect is not None and len(zeno_suppression_effect) == len(data_ts.value) and np.any(zeno_suppression_effect != 0): 
+                 ax.plot(time_vector, data_ts.value, color='#00FFFF', alpha=0.2, zorder=1) 
+                 suppressed_upper = data_ts.value - zeno_suppression_effect * 0.5 
+                 suppressed_lower = data_ts.value - zeno_suppression_effect * 1.5 
+                 ax.fill_between(time_vector, suppressed_lower, suppressed_upper, 
+                                color='#FF10F0', alpha=0.4, label='Zeno Suppression Effect (Conceptual)', zorder=2)
+            handles, labels = ax.get_legend_handles_labels()
+            if labels: ax.legend(handles, labels, facecolor='black', edgecolor='#BF40BF', labelcolor='white')
+        else: ax.text(0.5,0.5, "No data for Zeno plot.", color='gray', ha='center', va='center', transform=ax.transAxes)
+
+        ax.set_title('Time Series with Conceptual Zeno Suppression Overlay', color='#BF40BF')
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Strain')
+        ax.set_facecolor('black'); ax.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':')
+        for spine in ax.spines.values(): spine.set_color('#BF40BF')
+        ax.tick_params(colors='#00E5FF'); 
+        ax.xaxis.label.set_color('#00FFFF'); ax.yaxis.label.set_color('#00FFFF')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+    # --- NEW: Solar Resonance and CMB Echo Entanglement ---
+    def generate_solar_resonance_pattern(self, duration_s, sr, resonance_params=None):
+        if resonance_params is None:
+            sr_val = sr.value if hasattr(sr, 'value') else sr
+            min_freq_detectable = 2 / duration_s if duration_s > 0 else 1.0
+            resonance_params = [
+                {'freq': max(min_freq_detectable, 30), 'amp': 1e-22, 'phase_deg': 0},
+                {'freq': max(min_freq_detectable * 1.5, 70), 'amp': 0.7e-22, 'phase_deg': 60},
+                {'freq': max(min_freq_detectable * 2.0, 120), 'amp': 0.5e-22, 'phase_deg': 120}
+            ]
+        num_samples = int(duration_s * (sr.value if hasattr(sr, 'value') else sr))
+        if num_samples <= 0: return TimeSeries(np.array([]), sample_rate=sr, name="EmptySolarPattern")
+        
+        t = np.linspace(0, duration_s, num_samples, endpoint=False)
+        pattern = np.zeros_like(t)
+        for p in resonance_params:
+            pattern += p['amp'] * np.sin(2 * np.pi * p['freq'] * t + np.deg2rad(p['phase_deg']))
+        pattern += np.random.normal(0, 0.1e-22, len(t)) # Add slight noise
+        return TimeSeries(pattern, sample_rate=sr, name="SolarResonancePattern")
+
+    def analyze_cmb_echo_entanglement(self, solar_pattern_ts, base_cmb_map):
+        if not (hasattr(solar_pattern_ts, 'value') and solar_pattern_ts.value is not None and len(solar_pattern_ts.value) > 0):
+            return base_cmb_map, np.zeros_like(base_cmb_map), np.array([]), np.array([])
+
+        fft_segment_len = min(1024, len(solar_pattern_ts.value))
+        if fft_segment_len == 0:
+             return base_cmb_map, np.zeros_like(base_cmb_map), np.array([]), np.array([])
+
+        h_solar_segment = self.analyzer.hypermorphic_transform(solar_pattern_ts.value[:fft_segment_len], dimension=888)
+        h_fft_solar = self.analyzer.hypermorphic_fft(h_solar_segment)
+        classical_fft_solar_seg = np.fft.fft(solar_pattern_ts.value[:fft_segment_len])[:len(h_solar_segment)//2]
+        
+        solar_ripple_freqs, solar_ripple_devs = self.analyzer.detect_context_ripples(h_fft_solar, classical_fft_solar_seg)
+
+        echo_entanglement_map = np.zeros_like(base_cmb_map)
+        if len(solar_ripple_freqs) > 0 and len(solar_ripple_devs) > 0:
+            valid_solar_indices = np.isfinite(solar_ripple_freqs) & np.isfinite(solar_ripple_devs)
+            srf_valid = solar_ripple_freqs[valid_solar_indices]
+            srd_valid = solar_ripple_devs[valid_solar_indices]
+
+            if len(srf_valid) > 0:
+                min_f_solar, max_f_solar = np.min(srf_valid), np.max(srf_valid)
+                if max_f_solar > min_f_solar: # Avoid division by zero if all freqs are same
+                    norm_solar_freqs = (srf_valid - min_f_solar) / (max_f_solar - min_f_solar)
+                    y_indices_cmb = (norm_solar_freqs * (base_cmb_map.shape[0] - 1)).astype(int)
+                    
+                    for y_idx, dev_val in zip(y_indices_cmb, srd_valid):
+                        cmb_slice_profile = (np.sin(np.linspace(0, np.random.uniform(2,6)*np.pi, base_cmb_map.shape[1]))**2) * \
+                                            np.random.uniform(0.5, 1.5, base_cmb_map.shape[1])
+                        echo_entanglement_map[y_idx, :] += dev_val * cmb_slice_profile * 0.5 
+                elif len(srf_valid) == 1 : # Single frequency case
+                    y_idx = base_cmb_map.shape[0] // 2 # Put it in the middle
+                    dev_val = srd_valid[0]
+                    cmb_slice_profile = (np.sin(np.linspace(0, np.random.uniform(2,6)*np.pi, base_cmb_map.shape[1]))**2) * \
+                                        np.random.uniform(0.5, 1.5, base_cmb_map.shape[1])
+                    echo_entanglement_map[y_idx, :] += dev_val * cmb_slice_profile * 0.5
+
+            if np.any(echo_entanglement_map): # Only filter if there's something to filter
+                echo_entanglement_map = gaussian_filter(echo_entanglement_map, sigma=1.5)
+        
+        return base_cmb_map, echo_entanglement_map, solar_ripple_freqs, solar_ripple_devs
+
+    def plot_cmb_echo_entanglement(self, original_cmb, echo_map, solar_ripple_freqs, solar_ripple_devs, solar_pattern_ts, event_name):
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(1, 2, figsize=(18, 7), facecolor='black', gridspec_kw={'width_ratios': [1, 1.2]})
+        fig.suptitle(f'CMB Echo Entanglement (Conceptual) for {event_name}', fontsize=16, color='#BF40BF', y=0.98)
+
+        ax = axes[0]
+        ax.set_title('Solar Pattern & H-Ripples', color='#BF40BF')
+        if solar_pattern_ts is not None and hasattr(solar_pattern_ts, 'value') and len(solar_pattern_ts.value) > 0: 
+            time_solar = solar_pattern_ts.times.value
+            ax.plot(time_solar, solar_pattern_ts.value, color='#FFFF00', label='Solar Resonance Pattern', lw=1.5)
+            ax.set_xlabel('Time (s)', color='#00FFFF'); ax.set_ylabel('Pattern Strain', color='#FFFF00')
+            ax.tick_params(axis='y', labelcolor='#FFFF00')
+            
+            ax2 = ax.twinx()
+            if solar_ripple_freqs is not None and len(solar_ripple_freqs) > 0 and \
+               solar_ripple_devs is not None and len(solar_ripple_devs) == len(solar_ripple_freqs):
+                ax2.plot(solar_ripple_freqs, solar_ripple_devs, color='#FF10F0', marker='o', ms=3, ls=':', alpha=0.7, label='Solar Pattern H-Ripples')
+                ax2.set_ylabel('H-Ripple Deviation', color='#FF10F0')
+                ax2.tick_params(axis='y', labelcolor='#FF10F0')
+                ax2.set_yscale('log')
+
+            lines, labels = ax.get_legend_handles_labels()
+            if hasattr(ax2, 'get_legend_handles_labels'): # Check if ax2 was used
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                if labels2: # Only add if ax2 actually plotted something with a label
+                     ax2.legend(lines + lines2, labels + labels2, loc='upper right', facecolor='black', edgecolor='#BF40BF', labelcolor='white', fontsize='small')
+                elif labels: # Only ax has labels
+                    ax.legend(facecolor='black', edgecolor='#BF40BF', labelcolor='white', loc='upper right', fontsize='small')
+            elif labels: # Only ax has labels
+                 ax.legend(facecolor='black', edgecolor='#BF40BF', labelcolor='white', loc='upper right', fontsize='small')
+        else:
+            ax.text(0.5, 0.5, "Solar pattern data missing", color='gray', ha='center', va='center', transform=ax.transAxes)
+
+        ax = axes[1]
+        if original_cmb is not None:
+            ax.imshow(original_cmb, cmap='coolwarm', aspect='auto', origin='lower', alpha=0.7)
+            if echo_map is not None and echo_map.shape == original_cmb.shape and np.any(echo_map):
+                norm_echo_map = echo_map
+                max_echo_val = np.max(np.abs(echo_map))
+                if max_echo_val > 0 : norm_echo_map = echo_map / max_echo_val
+                
+                im_echo = ax.imshow(norm_echo_map, cmap='viridis', alpha=0.6, aspect='auto', origin='lower')
+                ax.set_title('CMB with Solar Echoes & Entanglement Zones', color='#BF40BF')
+                cbar = fig.colorbar(im_echo, ax=ax, fraction=0.046, pad=0.04, label='Normalized Echo Strength')
+                cbar.ax.yaxis.set_tick_params(color='#00E5FF'); cbar.set_label('Normalized Echo Strength', color='#00FFFF'); cbar.outline.set_edgecolor('#BF40BF')
+
+            else:
+                ax.set_title('CMB Data (No Echo Overlay)', color='#BF40BF')
+        else:
+            ax.text(0.5, 0.5, "CMB data not available.", color='gray', ha='center', va='center', transform=ax.transAxes)
+        ax.set_xlabel('Simulated Sky Patch X (pixels)'); ax.set_ylabel('Simulated Sky Patch Y / Solar Resonance Freq. Band')
+
+        for ax_item in axes:
+            ax_item.set_facecolor('black'); ax_item.grid(True, alpha=0.1, color='#6B0F9F', linestyle=':')
+            for spine in ax_item.spines.values(): spine.set_color('#BF40BF')
+            ax_item.tick_params(colors='#00E5FF')
+            if ax_item.get_xlabel(): ax_item.xaxis.label.set_color('#00FFFF')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+    # --- NEW: Provoke Xeno Collapse & Map Boundary State ---
+    def provoke_zeno_conditions_on_ripples(self, original_ripple_devs, original_ripple_freqs, epsilon_threshold,
+                                           provocation_factor=0.5, target_freq_range_hz=(50, 150)):
+        provoked_ripple_devs = np.copy(original_ripple_devs)
+        if original_ripple_freqs is None or len(original_ripple_freqs) == 0 or not np.any(np.isfinite(original_ripple_devs)):
+            return provoked_ripple_devs 
+
+        lower_bound = 0.1 * epsilon_threshold
+        upper_bound = epsilon_threshold
+        target_value_in_band = lower_bound + (upper_bound - lower_bound) * provocation_factor
+        
+        modified_count = 0
+        for i, freq in enumerate(original_ripple_freqs):
+            if target_freq_range_hz[0] <= freq <= target_freq_range_hz[1]:
+                provoked_ripple_devs[i] = target_value_in_band
+                modified_count +=1
+        # print(f"  Provoked Zeno: Modified {modified_count} ripple deviations in range {target_freq_range_hz} Hz to {target_value_in_band:.2e}") # Verbose
+        return provoked_ripple_devs
+
+    def map_zeno_boundary_state(self, data_ts, zeno_map, original_ripples_freq, original_ripples_dev, provoked_ripples_dev):
+        boundary_info = {'starts_time': [], 'ends_time': [], 'starts_idx': [], 'ends_idx': [], 'boundary_ripple_chars': {}}
+        if zeno_map is None or len(zeno_map) == 0 or not hasattr(data_ts, 'value') or len(zeno_map) != len(data_ts.value):
+            return boundary_info
+
+        threshold = 0.05 * np.max(zeno_map) if np.max(zeno_map) > 1e-9 else 1e-9 
+
+        active_zeno = zeno_map > threshold
+        diff_active_zeno = np.diff(active_zeno.astype(int))
+        
+        starts_indices = np.where(diff_active_zeno == 1)[0] + 1 
+        ends_indices = np.where(diff_active_zeno == -1)[0] + 1
+        
+        boundary_info['starts_idx'] = starts_indices
+        boundary_info['ends_idx'] = ends_indices
+        boundary_info['starts_time'] = data_ts.times.value[starts_indices] if len(starts_indices) > 0 else []
+        boundary_info['ends_time'] = data_ts.times.value[ends_indices] if len(ends_indices) > 0 else []
+        
+        if len(original_ripples_dev[np.isfinite(original_ripples_dev)]) > 0 and \
+           len(provoked_ripples_dev[np.isfinite(provoked_ripples_dev)]) > 0 :
+             avg_orig_dev = np.mean(original_ripples_dev[np.isfinite(original_ripples_dev)])
+             avg_prov_dev = np.mean(provoked_ripples_dev[np.isfinite(provoked_ripples_dev)])
+             boundary_info['boundary_ripple_chars'] = {
+                 'avg_original_ripple_dev': avg_orig_dev,
+                 'avg_provoked_ripple_dev_for_zeno': avg_prov_dev,
+             }
+        return boundary_info
+
+    def plot_provoked_zeno_layer_results(self, data_ts, zeno_suppression_effect, boundary_info, event_name):
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(1, 1, figsize=(14, 7), facecolor='black')
+        fig.suptitle(f'Provoked Zeno Layer & Boundary State for {event_name}', fontsize=16, color='#BF40BF', y=0.98)
+
+        if not (hasattr(data_ts, 'times') and hasattr(data_ts, 'value') and \
+                data_ts.times is not None and data_ts.value is not None and len(data_ts.value) > 0) :
+            ax.text(0.5,0.5, "No data for Provoked Zeno plot.", color='gray', ha='center', va='center', transform=ax.transAxes)
+        else:
+            time_vector = data_ts.times.value
+            ax.plot(time_vector, data_ts.value, label='Original Strain', color='#00FFFF', alpha=0.8, zorder=5)
+            
+            if zeno_suppression_effect is not None and len(zeno_suppression_effect) == len(data_ts.value) and np.any(zeno_suppression_effect != 0):
+                ax.plot(time_vector, data_ts.value, color='#00FFFF', alpha=0.2, zorder=1) 
+                suppressed_upper = data_ts.value - zeno_suppression_effect * 0.5
+                suppressed_lower = data_ts.value - zeno_suppression_effect * 1.5
+                ax.fill_between(time_vector, suppressed_lower, suppressed_upper,
+                                color='#FF10F0', alpha=0.4, label='Provoked Zeno Suppression', zorder=2)
+
+                for start_time_val in boundary_info.get('starts_time', []):
+                    ax.axvline(start_time_val, color='lime', linestyle='--', lw=1.5, label='Zeno Start' if 'Zeno Start' not in [l.get_label() for l in ax.lines] else "")
+                for end_time_val in boundary_info.get('ends_time', []):
+                    ax.axvline(end_time_val, color='red', linestyle='--', lw=1.5, label='Zeno End' if 'Zeno End' not in [l.get_label() for l in ax.lines] else "")
+            
+            handles, labels = ax.get_legend_handles_labels() # Get unique labels
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys(), facecolor='black', edgecolor='#BF40BF', labelcolor='white', loc='upper right')
+            
+            ripple_chars = boundary_info.get('boundary_ripple_chars', {})
+            if ripple_chars:
+                char_text = "Boundary State (Conceptual):\n"
+                char_text += f"  Avg Original Ripple Dev: {ripple_chars.get('avg_original_ripple_dev', np.nan):.2e}\n"
+                char_text += f"  Avg Provoked Ripple Dev: {ripple_chars.get('avg_provoked_ripple_dev_for_zeno', np.nan):.2e}"
+                ax.text(0.02, 0.02, char_text, transform=ax.transAxes, fontsize=9, color='lightgrey',
+                        verticalalignment='bottom', bbox=dict(boxstyle='round,pad=0.5', fc='black', ec='#BF40BF', alpha=0.7))
+        
+        ax.set_title('Time Series with Provoked Zeno Suppression and Boundary Markers', color='#BF40BF')
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Strain')
+        ax.set_facecolor('black'); ax.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':')
+        for spine in ax.spines.values(): spine.set_color('#BF40BF')
+        ax.tick_params(colors='#00E5FF');
+        ax.xaxis.label.set_color('#00FFFF'); ax.yaxis.label.set_color('#00FFFF')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+    # --- NEW: HCE Dark Matter/Energy Conceptualization ---
+    def analyze_hce_dark_matter_energy_effects(self, data_ts, ripple_freqs, ripple_devs, base_event_name=""):
+        """
+        Conceptually models how HCE morphic fields might relate to dark matter/energy.
+        This is highly speculative and illustrative.
+        """
+        time_val = data_ts.times.value if hasattr(data_ts, 'times') and data_ts.times is not None else np.arange(len(data_ts.value)) / self.analyzer.sample_rate
+        
+        results = {
+            'time': time_val,
+            'original_strain': data_ts.value,
+            'morphic_field_strength_profile': np.zeros_like(data_ts.value),
+            'dark_energy_contribution': np.zeros_like(data_ts.value), 
+            'dark_matter_potential_modification': np.zeros_like(data_ts.value),
+            'hce_activity_metric': 0.0,
+            'base_event_name': base_event_name
+        }
+
+        if ripple_devs is not None:
+            valid_ripple_devs = ripple_devs[np.isfinite(ripple_devs) & (ripple_devs > 0.01)] # Consider only devs > 1%
+            if len(valid_ripple_devs) > 0:
+                hce_activity = np.mean(valid_ripple_devs)
+            else:
+                hce_activity = 0.0 # Default if no strong ripples
+        else:
+            hce_activity = 0.0 # Default low activity
+
+        results['hce_activity_metric'] = hce_activity
+
+        signal_envelope = np.abs(signal.hilbert(data_ts.value))
+        signal_envelope_norm = signal_envelope / (np.max(signal_envelope) + 1e-12) # Normalized, avoid div by zero
+        
+        morphic_field_strength = hce_activity * signal_envelope_norm * 1e-21 # Arbitrary scaling for field strength
+        results['morphic_field_strength_profile'] = morphic_field_strength
+
+        de_factor = 0.5 # Conceptual: DE contribution is proportional to average morphic field strength
+        results['dark_energy_contribution'] = np.full_like(data_ts.value, de_factor * np.mean(morphic_field_strength))
+                                           
+        dm_factor = -1.0 # Conceptual: DM potential modification (attractive)
+        if np.any(morphic_field_strength > 1e-25): # Only apply if field is somewhat significant
+            peak_idx = np.argmax(morphic_field_strength)
+            t_indices = np.arange(len(data_ts.value))
+            sigma_potential = len(data_ts.value) / 8.0 
+            gaussian_potential_profile = np.exp(-((t_indices - peak_idx)**2) / (2 * sigma_potential**2))
+            results['dark_matter_potential_modification'] = dm_factor * np.max(morphic_field_strength) * gaussian_potential_profile
+        
+        return results
+
+    def plot_hce_dark_matter_energy_effects(self, hce_dm_de_results):
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True, facecolor='black')
+        event_name = hce_dm_de_results.get('base_event_name', "Conceptual")
+        fig.suptitle(f'HCE: Dark Matter/Energy Morphic Field Effects (Conceptual)\nEvent: {event_name}', 
+                     fontsize=16, color='#BF40BF', y=0.99)
+
+        time = hce_dm_de_results['time']
+        original_strain = hce_dm_de_results['original_strain']
+        morphic_field = hce_dm_de_results['morphic_field_strength_profile']
+        de_effect = hce_dm_de_results['dark_energy_contribution']
+        dm_effect = hce_dm_de_results['dark_matter_potential_modification']
+        hce_activity_metric = hce_dm_de_results['hce_activity_metric']
+
+        ax = axes[0]
+        ax.plot(time, original_strain, color='#00FFFF', label='Original Signal Strain', alpha=0.7, zorder=1)
+        ax.set_ylabel('Strain', color='#00FFFF')
+        ax.tick_params(axis='y', labelcolor='#00FFFF')
+        
+        ax_twin = ax.twinx()
+        ax_twin.plot(time, morphic_field, color='#FFD700', label='Morphic Field Strength Profile', linestyle='--', zorder=2)
+        ax_twin.set_ylabel('Morphic Field (Rel. Strength)', color='#FFD700')
+        ax_twin.tick_params(axis='y', labelcolor='#FFD700')
+        max_morphic_field = np.max(morphic_field) if len(morphic_field) > 0 else 0
+        if max_morphic_field > 0: ax_twin.set_ylim(bottom=0, top=max_morphic_field * 1.1) 
+        else: ax_twin.set_ylim(bottom=0, top=1e-22) 
+
+
+        ax.set_title(f'Signal & Conceptual Morphic Field (HCE Activity: {hce_activity_metric:.2e})', color='#BF40BF')
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax_twin.get_legend_handles_labels()
+        ax_twin.legend(lines + lines2, labels + labels2, loc='upper right', facecolor='black', edgecolor='#BF40BF', labelcolor='white', fontsize='small')
+
+        ax = axes[1]
+        ax.plot(time, de_effect, color='#ADFF2F', label='Dark Energy Contribution (Conceptual Shift)')
+        ax.set_ylabel('Δ Vacuum Energy (Conceptual)', color='#ADFF2F')
+        ax.tick_params(axis='y', labelcolor='#ADFF2F')
+        ax.set_title('Conceptual Dark Energy Contribution via HCE', color='#BF40BF')
+        ax.legend(facecolor='black', edgecolor='#BF40BF', labelcolor='white', loc='upper right')
+        if not np.any(de_effect) or np.all(np.abs(de_effect) < 1e-25):
+            ax.text(0.5, 0.5, "Negligible DE effect from HCE activity", color="grey", ha="center", va="center", transform=ax.transAxes)
+        
+        max_abs_de = np.max(np.abs(de_effect)) if len(de_effect) > 0 else 0
+        if max_abs_de > 0: ax.set_ylim(np.min(de_effect)*0.9 if np.min(de_effect)<0 else 0, max_abs_de*1.1 if max_abs_de>0 else 1e-23)
+        else: ax.set_ylim(0, 1e-23)
+
+
+        ax = axes[2]
+        ax.plot(time, dm_effect, color='#FF69B4', label='Dark Matter Potential Mod. (Conceptual)')
+        ax.set_ylabel('Δ Grav. Potential (Conceptual)', color='#FF69B4')
+        ax.tick_params(axis='y', labelcolor='#FF69B4')
+        ax.set_title('Conceptual Dark Matter Potential Modification via HCE', color='#BF40BF')
+        ax.legend(facecolor='black', edgecolor='#BF40BF', labelcolor='white', loc='upper right')
+        if not np.any(dm_effect) or np.all(np.abs(dm_effect) < 1e-25):
+            ax.text(0.5, 0.5, "Negligible DM effect from HCE activity", color="grey", ha="center", va="center", transform=ax.transAxes)
+        
+        max_abs_dm = np.max(np.abs(dm_effect)) if len(dm_effect) > 0 else 0
+        if max_abs_dm > 0 : ax.set_ylim(np.min(dm_effect)*1.1, np.max(dm_effect)*1.1 if np.max(dm_effect) > 0 else 0 ) # adjust for negative and positive potential
+        else: ax.set_ylim(-1e-23, 1e-23)
+
+
+        ax.set_xlabel('Time (s)', color='#00FFFF')
+        for ax_item in axes:
+            ax_item.set_facecolor('black')
+            ax_item.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':')
+            for spine in ax_item.spines.values(): spine.set_color('#BF40BF')
+            ax_item.tick_params(axis='x', colors='#00E5FF')
+            ax_item.xaxis.label.set_color('#00FFFF')
+            
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        return fig
+
+# --- Entanglement Analyzer ---
+class EntanglementAnalyzer:
+    def __init__(self, analyzer_instance):
+        self.analyzer = analyzer_instance
+
+    def calculate_local_phase_coherence(self, h_stft_phases, phase_diff_threshold_rad=np.pi/4, min_run_length=3):
+        if h_stft_phases is None or h_stft_phases.ndim != 2 or h_stft_phases.shape[1] < 2:
+            return np.array([])
+
+        n_freqs, n_times = h_stft_phases.shape
+        coherence_scores = np.zeros(n_freqs)
+
+        for k_freq in range(n_freqs):
+            phases = h_stft_phases[k_freq, :]
+            valid_phases_mask = ~np.isnan(phases)
+            phases_valid = phases[valid_phases_mask]
+            if len(phases_valid) < 2: continue
+
+            phase_diffs = np.diff(phases_valid)
+            phase_diffs = (phase_diffs + np.pi) % (2 * np.pi) - np.pi
+            
+            coherent_segments_count = 0
+            current_run_len = 0
+            for diff_val in phase_diffs:
+                if abs(diff_val) < phase_diff_threshold_rad:
+                    current_run_len += 1
+                else:
+                    if current_run_len >= min_run_length -1: 
+                        coherent_segments_count += (current_run_len + 1) 
+                    current_run_len = 0
+            if current_run_len >= min_run_length -1 : 
+                coherent_segments_count += (current_run_len + 1)
+            
+            coherence_scores[k_freq] = coherent_segments_count / len(phases_valid) if len(phases_valid) > 0 else 0
+        
+        return coherence_scores
+
+    def plot_local_phase_coherence(self, frequencies, coherence_scores, event_name):
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(1, 1, figsize=(12, 7), facecolor='black')
+        fig.suptitle(f'Local Phase Coherence Index for {event_name}', fontsize=16, color='#BF40BF', y=0.98)
+
+        if len(frequencies) > 0 and len(coherence_scores) == len(frequencies):
+            ax.plot(frequencies, coherence_scores, color='#ADFF2F', marker='.', linestyle='-', label='Phase Coherence Score')
+            ax.set_xlabel('Frequency (Hz)', color='#00FFFF')
+            ax.set_ylabel('Coherence Score (Fraction of Stable Segments)', color='#ADFF2F')
+            ax.set_ylim(0, 1.05)
+            ax.legend(facecolor='black', edgecolor='#BF40BF', labelcolor='white')
+        else:
+            ax.text(0.5,0.5, "No phase coherence data to plot.", color='gray', ha='center', va='center', transform=ax.transAxes)
+
+        ax.set_title('Local Phase Stability Index Across Frequencies', color='#BF40BF')
+        ax.set_facecolor('black'); ax.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':')
+        for spine in ax.spines.values(): spine.set_color('#BF40BF')
+        ax.tick_params(colors='#00E5FF')
+        plt.tight_layout(rect=[0, 0, 1, 0.95]); return fig
+
+
+if __name__ == "__main__":
+    plt.close('all') 
+    analyzer = HyperMorphicGWAnalyzer() 
+
+    print("\n--- Running Standard Base Analysis ---")
+    event_to_analyze = 'GW150914' 
+    
+    base_results, base_fig = analyzer.run_analysis(event_to_analyze)
+    if base_fig is not None: 
+        base_fig.savefig(f'hypermorphic_base_{event_to_analyze}.png', dpi=150, facecolor='black') 
+        print(f"\nBase analysis for {event_to_analyze} saved.")
+        print("\n--- Base Analysis Numerical Summary ---")
+        if base_results:
+            print(f"  Event: {event_to_analyze}")
+            print(f"  H1 Strain samples: {len(base_results.get('strain_h1', []))}")
+            if base_results.get('strain_l1') is not None:
+                print(f"  L1 Strain samples: {len(base_results.get('strain_l1', []))}")
+            
+            print("  Epsilon Counts by Mode:")
+            for mode, count in base_results.get('epsilon_count', {}).items():
+                print(f"    {mode}: {count}")
+            
+            ripple_freq_base = base_results.get('ripple_freq')
+            ripple_dev_base = base_results.get('ripple_dev')
+            if ripple_freq_base is not None and ripple_dev_base is not None and len(ripple_freq_base) > 0:
+                finite_ripple_dev_base = ripple_dev_base[np.isfinite(ripple_dev_base)]
+                if len(finite_ripple_dev_base) > 0:
+                    mean_ripple = np.mean(finite_ripple_dev_base)
+                    max_ripple = np.max(finite_ripple_dev_base)
+                    print(f"  Context Ripples (Default Mode): Mean Dev={mean_ripple:.2e}, Max Dev={max_ripple:.2e}")
+                else: print(f"  Context Ripples (Default Mode): No finite ripple deviations.")
+            else: print(f"  Context Ripples (Default Mode): No ripple data.")
+        else: print("  Base results dictionary is empty.")
+        if GWPY_AVAILABLE: plt.show(block=False) # Only show if plots can be generated
+
+    else: print(f"Base analysis for {event_to_analyze} failed to produce a figure.")
+
+    data_for_demos_ts = None 
+    demo_data_name = ""
+    if base_results and base_results.get('strain_h1') is not None and \
+       isinstance(base_results['strain_h1'], np.ndarray) and \
+       len(base_results['strain_h1']) >= analyzer.sample_rate * 0.5: 
+        if np.any(base_results['strain_h1']): 
+            print(f"\nUsing processed real data from {event_to_analyze} for feature demos.")
+            data_for_demos_ts = TimeSeries(base_results['strain_h1'], 
+                                        sample_rate=analyzer.sample_rate, 
+                                        t0=base_results['time'][0] if base_results.get('time') is not None and len(base_results['time']) > 0 else 0,
+                                        name=f"Real_{event_to_analyze}_Segment")
+            demo_data_name = f"Real_{event_to_analyze}" 
+        else:
+            print(f"\nProcessed real data from {event_to_analyze} is all zeros. Generating synthetic for demos.")
+            data_for_demos_ts = None 
+            
+    if data_for_demos_ts is None: 
+        demo_duration = 0.75 
+        print(f"\nGenerating {demo_duration}s synthetic data for feature demos.")
+        data_for_demos_ts = analyzer.generate_synthetic_gw(duration=demo_duration, f0=50, f1=200) 
+        demo_data_name = f"SynthDemo_{demo_duration:.2f}s"
+
+    if not (data_for_demos_ts is not None and hasattr(data_for_demos_ts, 'value') and data_for_demos_ts.value is not None and len(data_for_demos_ts.value) > 0):
+        print(f"CRITICAL: Demo data could not be prepared. Skipping feature demos.")
+    else:
+        print(f"Using data '{data_for_demos_ts.name}' ({len(data_for_demos_ts.value)} samples) for feature demos.")
+        print(f"  Demo data start time: {data_for_demos_ts.t0.value}, duration: {data_for_demos_ts.duration.value:.2f}s, sample rate: {data_for_demos_ts.sample_rate.value} Hz")
+
+        # --- 1. Epsilon Sensitivity Sweep ---
+        print("\n\n--- Feature 1: Epsilon Sensitivity Sweep ---")
+        epsilon_sweep_range = np.logspace(-45, -35, 3) 
+        sweep_run_results = analyzer.epsilon_sweeper.sweep_epsilon(data_for_demos_ts, epsilon_sweep_range)
+        if sweep_run_results: 
+            print("  Epsilon Sweep Numerical Results:")
+            for eps_val, res_data in sweep_run_results.items():
+                print(f"    ε_H={eps_val:.1e}: Occurrences={res_data['epsilon_occurrences']}, MeanRipple={res_data['mean_ripple_deviation']:.2e}, MaxRipple={res_data['max_ripple_deviation']:.2e}")
+            fig_sweep = analyzer.epsilon_sweeper.plot_sweep_results(sweep_run_results, demo_data_name)
+            if fig_sweep: fig_sweep.savefig('epsilon_sweep_analysis.png', dpi=150, facecolor='black'); 
+            if GWPY_AVAILABLE: plt.show(block=False)
+        else: print("  Epsilon sweep did not produce results.")
+
+
+        # --- 2. Wave Interference ---
+        print("\n\n--- Feature 2: Wave Interference Engine ---")
+        interf_demo_duration = data_for_demos_ts.duration.value if hasattr(data_for_demos_ts,'duration') and data_for_demos_ts.duration.value > 0 else 0.5
+        synth_wave1 = analyzer.generate_synthetic_gw(duration=interf_demo_duration, f0=40, f1=150)
+        synth_wave2 = analyzer.generate_synthetic_gw(duration=interf_demo_duration, f0=60, f1=250) 
+        valid_synth_waves = all(
+            sw is not None and hasattr(sw, 'value') and sw.value is not None and len(sw.value) > 0 
+            for sw in [synth_wave1, synth_wave2]
+        )
+        if valid_synth_waves:
+            interference_fft_len = int(min(len(synth_wave1.value), len(synth_wave2.value), 512))
+            if interference_fft_len > 0:
+                interference_results = analyzer.interference_engine.analyze_interference(
+                    [synth_wave1, synth_wave2], fft_segment_len=interference_fft_len
+                )
+                print("  Interference Analysis Numerical Results (Combined Signal Ripples):")
+                rfc_comb = interference_results.get('ripple_freq_combined')
+                rdc_comb = interference_results.get('ripple_dev_combined')
+                if rfc_comb is not None and len(rfc_comb) > 0 and rdc_comb is not None and len(rdc_comb) > 0:
+                    finite_rdc = rdc_comb[np.isfinite(rdc_comb)]
+                    if len(finite_rdc) > 0:
+                        mean_dev_comb = np.mean(finite_rdc)
+                        max_dev_comb = np.max(finite_rdc)
+                        print(f"    Mean Combined Ripple Dev: {mean_dev_comb:.2e}, Max Combined Ripple Dev: {max_dev_comb:.2e}")
+                    else: print("    No finite combined ripples detected.")
+                else: print("    No combined ripples data.")
+                fig_interference = analyzer.interference_engine.plot_interference_results(interference_results, "SyntheticPair_Interference")
+                if fig_interference: fig_interference.savefig('wave_interference_analysis.png', dpi=150, facecolor='black'); 
+                if GWPY_AVAILABLE: plt.show(block=False)
+            else: print("Skipping Wave Interference: effective FFT length is zero.")
+        else: print("Skipping Wave Interference: invalid synthetic waves for interference.")
+
+
+        # --- 3. Gate Drift ---
+        print("\n\n--- Feature 3: Gate Drift Engine ---")
+        fft_segment_len_drift = min(512, len(data_for_demos_ts.value)) 
+        if fft_segment_len_drift > 0:
+            base_h_data_seg_drift = analyzer.hypermorphic_transform(data_for_demos_ts.value[:fft_segment_len_drift], dimension=0)
+            base_classical_fft_seg_drift = np.fft.fft(data_for_demos_ts.value[:fft_segment_len_drift])[:len(base_h_data_seg_drift)//2] 
+            base_h_fft_seg_drift = analyzer.hypermorphic_fft(base_h_data_seg_drift)
+            base_ripple_freq_drift, base_ripple_dev_drift = analyzer.detect_context_ripples(base_h_fft_seg_drift, base_classical_fft_seg_drift)
+            base_results_for_drift_plot = {
+                'h_data_real_segment': [h.value.real for h in base_h_data_seg_drift if hasattr(h,'value')],
+                'ripple_freq': base_ripple_freq_drift, 'ripple_dev': base_ripple_dev_drift }
+            
+            drift_analysis = analyzer.gate_drift_engine.analyze_with_drift(
+                data_for_demos_ts, p_amp=5, ps_amp=5, p_freq=0.5, ps_freq=0.5, fft_len=fft_segment_len_drift 
+            )
+            print("  Gate Drift Analysis Numerical Results (Drifted Signal Ripples):")
+            rd_drift = drift_analysis.get('ripple_dev_drift')
+            if rd_drift is not None and len(rd_drift) > 0:
+                finite_rd_drift = rd_drift[np.isfinite(rd_drift)]
+                if len(finite_rd_drift)>0:
+                    mean_dev_drift = np.mean(finite_rd_drift); max_dev_drift = np.max(finite_rd_drift)
+                    print(f"    Mean Drifted Ripple Dev: {mean_dev_drift:.2e}, Max Drifted Ripple Dev: {max_dev_drift:.2e}")
+                else: print("    No finite drifted ripples detected.")
+            else: print("    No drifted ripples data.")
+            fig_drift = analyzer.gate_drift_engine.plot_drift_results(drift_analysis, base_results_for_drift_plot, demo_data_name)
+            if fig_drift: fig_drift.savefig('gate_drift_analysis.png', dpi=150, facecolor='black'); 
+            if GWPY_AVAILABLE: plt.show(block=False)
+        else: print("Skipping Gate Drift: demo data too short for segment.")
+
+
+        # --- 4. Synthetic Source ---
+        print("\n\n--- Feature 4: Synthetic Source Engine ---")
+        non_gr_params_demo = {'f0': 25, 'f1': 250, 'mass_evol_factor': 0.3, 
+                              'epsilon_fractures': [(0.4, 0.45, 1e-30)], 'hm_dim': 137 }
+        synth_dur = data_for_demos_ts.duration.value if hasattr(data_for_demos_ts,'duration') and data_for_demos_ts.duration.value > 0 else 0.5
+        non_gr_wave_demo = analyzer.synthetic_source_engine.generate_non_gr_waveform(
+            dur=synth_dur, sr=analyzer.sample_rate, params=non_gr_params_demo
+        )
+        if non_gr_wave_demo is not None and hasattr(non_gr_wave_demo,'value') and \
+           non_gr_wave_demo.value is not None and len(non_gr_wave_demo.value) > 0:
+            synthetic_fft_len = min(512, len(non_gr_wave_demo.value)) 
+            if synthetic_fft_len > 0:
+                synthetic_analysis = analyzer.synthetic_source_engine.analyze_synthetic_source(
+                    non_gr_wave_demo, hm_params=non_gr_params_demo, fft_len=synthetic_fft_len
+                )
+                print("  Synthetic Source Analysis Numerical Results (Non-GR Ripples):")
+                rd_nongr = synthetic_analysis.get('ripple_dev_non_gr')
+                if rd_nongr is not None and len(rd_nongr) > 0:
+                    finite_rd_nongr = rd_nongr[np.isfinite(rd_nongr)]
+                    if len(finite_rd_nongr) > 0:
+                        mean_dev_nongr = np.mean(finite_rd_nongr); max_dev_nongr = np.max(finite_rd_nongr)
+                        print(f"    Mean Non-GR Ripple Dev: {mean_dev_nongr:.2e}, Max Non-GR Ripple Dev: {max_dev_nongr:.2e}")
+                    else: print("    No finite Non-GR ripples detected.")
+                else: print("    No Non-GR ripples data.")
+                fig_synthetic = analyzer.synthetic_source_engine.plot_synthetic_results(synthetic_analysis, "NonGR_DemoSource1")
+                if fig_synthetic: fig_synthetic.savefig('synthetic_source_analysis.png', dpi=150, facecolor='black'); 
+                if GWPY_AVAILABLE: plt.show(block=False)
+            else: print("Skipping Synthetic Source: generated wave too short for FFT.")
+        else: print("Skipping Synthetic Source: invalid generated wave.")
+
+        # --- 5. Dynamic Ripple Tracker & Entanglement Phase Stability ---
+        print("\n\n--- Feature 5 & Entanglement: Dynamic Ripple Tracker & Phase Stability ---")
+        stft_window_size = 256  
+        dynamic_ripple_data = None # Initialize
+        if data_for_demos_ts is not None and hasattr(data_for_demos_ts,'value') and \
+           data_for_demos_ts.value is not None and len(data_for_demos_ts.value) >= stft_window_size : 
+            dynamic_ripple_data = analyzer.dynamic_ripple_tracker.track_dynamic_ripples(
+                data_for_demos_ts, win_size=stft_window_size, ovlp_ratio=0.5 
+            )
+            if dynamic_ripple_data.get('ripple_spectrogram') is not None and dynamic_ripple_data['ripple_spectrogram'].size > 0:
+                finite_spectrogram_ripples = dynamic_ripple_data['ripple_spectrogram'][np.isfinite(dynamic_ripple_data['ripple_spectrogram'])]
+                if len(finite_spectrogram_ripples) > 0:
+                    mean_dyn_ripple = np.mean(finite_spectrogram_ripples)
+                    max_dyn_ripple = np.max(finite_spectrogram_ripples)
+                    print(f"  Dynamic Ripple Tracker: Mean Spectrogram Deviation = {mean_dyn_ripple:.2e}, Max = {max_dyn_ripple:.2e}")
+                else: print("  Dynamic Ripple Tracker: Spectrogram contains no finite ripple values.")
+                fig_dyn_ripples = analyzer.dynamic_ripple_tracker.plot_dynamic_ripple_results(dynamic_ripple_data, demo_data_name)
+                if fig_dyn_ripples: fig_dyn_ripples.savefig('dynamic_ripple_analysis.png', dpi=150, facecolor='black'); 
+                if GWPY_AVAILABLE: plt.show(block=False)
+
+                h_stft_phases = dynamic_ripple_data.get('h_stft_phases')
+                stft_frequencies = dynamic_ripple_data.get('f')
+                if h_stft_phases is not None and stft_frequencies is not None:
+                    coherence_scores = analyzer.entanglement_analyzer.calculate_local_phase_coherence(h_stft_phases)
+                    if len(coherence_scores) > 0 and np.any(np.isfinite(coherence_scores)) :
+                        print("  Local Phase Coherence Numerical Summary (mean score):", np.nanmean(coherence_scores))
+                        fig_phase_coh = analyzer.entanglement_analyzer.plot_local_phase_coherence(stft_frequencies, coherence_scores, demo_data_name)
+                        if fig_phase_coh: fig_phase_coh.savefig('local_phase_coherence.png', dpi=150, facecolor='black'); 
+                        if GWPY_AVAILABLE: plt.show(block=False)
+                    else: print("  Could not calculate meaningful phase coherence scores.")
+                else: print("  H-STFT phase data not available for coherence analysis.")
+            else: print("Dynamic ripple analysis produced no data to plot for STFT.")
+        else:
+            demo_data_len = len(data_for_demos_ts.value) if (data_for_demos_ts is not None and hasattr(data_for_demos_ts,'value') and data_for_demos_ts.value is not None) else 0
+            print(f"Skipping Dynamic Ripple Tracker & Phase Coherence: demo data ({demo_data_len} pts) too short for STFT window ({stft_window_size} pts).")
+    
+        # --- Optional Features Demonstrations (Existing + New) ---
+        print("\n\n--- Optional Feature Demonstrations (All) ---")
+        
+        rf_opt, rd_opt = np.array([]), np.array([])
+        if base_results and base_results.get('ripple_freq') is not None and len(base_results['ripple_freq']) > 0:
+             rf_opt = base_results['ripple_freq']
+             rd_opt = base_results['ripple_dev']
+        
+        if (len(rf_opt) == 0 or len(rd_opt) == 0) and data_for_demos_ts is not None and hasattr(data_for_demos_ts,'value') and len(data_for_demos_ts.value) > 0:
+            print("    Base results did not provide ripples, analyzing demo data for its H-ripples...")
+            temp_fft_len_opt = min(512, len(data_for_demos_ts.value))
+            if temp_fft_len_opt > 0:
+                temp_h_data_opt = analyzer.hypermorphic_transform(data_for_demos_ts.value[:temp_fft_len_opt], dimension=99) 
+                temp_h_fft_opt = analyzer.hypermorphic_fft(temp_h_data_opt)
+                temp_classical_fft_opt = np.fft.fft(data_for_demos_ts.value[:temp_fft_len_opt])[:len(temp_h_data_opt)//2]
+                rf_opt, rd_opt = analyzer.detect_context_ripples(temp_h_fft_opt, temp_classical_fft_opt)
+                if len(rf_opt) > 0: print(f"    Sourced {len(rf_opt)} H-ripple points from demo data for optional features.")
+            else: print("    Demo data too short for H-ripple analysis for optional features.")
+
+        if len(rf_opt) == 0: 
+            print("    Using hardcoded fallback ripple data for optional features as no other source found.")
+            rf_opt = np.array([50, 100, 150, 200, 250]); rd_opt = np.array([0.1, 0.5, 0.2, 0.6, 0.3])
+
+
+        # --- Existing Optional: CMB Overlay (Original Interpretation) ---
+        print("\n--- Optional (Original): CMB Ripple Overlay ---")
+        cmb_map_orig, resonance_overlay_orig = analyzer.optional_feature_analyzer.analyze_cmb_overlay(
+            h_ripple_map_freqs=rf_opt, h_ripple_map_devs=rd_opt 
+        )
+        fig_cmb_orig = analyzer.optional_feature_analyzer.plot_cmb_overlay(cmb_map_orig, resonance_overlay_orig, f"{demo_data_name}_OriginalCMB")
+        if fig_cmb_orig: fig_cmb_orig.savefig('cmb_overlay_analysis_original.png', dpi=150, facecolor='black'); 
+        if GWPY_AVAILABLE: plt.show(block=False)
+
+        # --- NEW: Solar Resonance and CMB Echo Entanglement ---
+        print("\n--- Optional (New): Solar Resonance & CMB Echo Entanglement ---")
+        solar_pattern_dur = data_for_demos_ts.duration.value if hasattr(data_for_demos_ts, 'duration') and data_for_demos_ts.duration.value > 0 else 0.5
+        solar_pat_ts = analyzer.optional_feature_analyzer.generate_solar_resonance_pattern(
+            duration_s=solar_pattern_dur, 
+            sr=data_for_demos_ts.sample_rate 
+        )
+        if hasattr(solar_pat_ts, 'value') and len(solar_pat_ts.value) > 0:
+            base_cmb = analyzer.optional_feature_analyzer._generate_mock_cmb_data(size=(120,240)) 
+            cmb_echo_base, cmb_echo_map, sol_rf, sol_rd = analyzer.optional_feature_analyzer.analyze_cmb_echo_entanglement(solar_pat_ts, base_cmb)
+            
+            print(f"  Solar pattern generated with {len(solar_pat_ts.value)} samples. Analyzed for H-ripples: {len(sol_rf)} points found.")
+            if np.any(cmb_echo_map): print(f"  CMB echo map generated with max echo strength: {np.max(cmb_echo_map):.2e}")
+            else: print("  CMB echo map is zero, solar ripples might not have mapped effectively or were too weak.")
+
+            fig_cmb_echo = analyzer.optional_feature_analyzer.plot_cmb_echo_entanglement(
+                cmb_echo_base, cmb_echo_map, sol_rf, sol_rd, solar_pat_ts, demo_data_name
+            )
+            if fig_cmb_echo: fig_cmb_echo.savefig('cmb_echo_entanglement_analysis.png', dpi=150, facecolor='black'); 
+            if GWPY_AVAILABLE: plt.show(block=False)
+        else:
+            print("  Skipping Solar Resonance & CMB Echo: Solar pattern generation failed or was empty.")
+
+
+        # --- Existing Optional: Solar System Pulse Injection ---
+        print("\n--- Optional (Original): Solar System Pulse Injection ---")
+        solar_pulse_duration = data_for_demos_ts.duration.value if hasattr(data_for_demos_ts,'duration') and data_for_demos_ts.duration.value > 0 else 0.5
+        solar_pulse = analyzer.optional_feature_analyzer.generate_solar_system_pulse(duration_s=solar_pulse_duration, strength=5e-22)
+        if hasattr(solar_pulse, 'value') and hasattr(data_for_demos_ts, 'value') and \
+           len(solar_pulse.value) == len(data_for_demos_ts.value) and len(solar_pulse.value) > 0:
+            data_with_pulse = TimeSeries(data_for_demos_ts.value + solar_pulse.value, sample_rate=analyzer.sample_rate, t0=data_for_demos_ts.t0)
+            
+            fig_pulse, ax_pulse = plt.subplots(1,1,figsize=(12,6), facecolor='black')
+            ax_pulse.set_facecolor('black'); ax_pulse.grid(True, alpha=0.2, color='#6B0F9F', linestyle=':')
+            time_vec_pulse = data_with_pulse.times.value
+            ax_pulse.plot(time_vec_pulse, data_for_demos_ts.value, label='Original Demo Data', color='#00FFFF', alpha=0.7)
+            ax_pulse.plot(time_vec_pulse, solar_pulse.value, label='Solar Pulse', color='#FFD700', alpha=0.7, linestyle='--') 
+            ax_pulse.plot(time_vec_pulse, data_with_pulse.value, label='Combined Data', color='white', linewidth=1.5)
+            ax_pulse.set_xlabel("Time (s)", color="#00FFFF"); ax_pulse.set_ylabel("Strain", color="#00FFFF")
+            ax_pulse.set_title("Solar System Pulse Injection (Conceptual)", color="#BF40BF")
+            ax_pulse.legend(facecolor='black', edgecolor='#BF40BF', labelcolor='white')
+            for spine in ax_pulse.spines.values(): spine.set_color('#BF40BF')
+            ax_pulse.tick_params(colors='#00E5FF')
+            fig_pulse.tight_layout()
+            fig_pulse.savefig('solar_pulse_injection.png', dpi=150, facecolor='black')
+            if GWPY_AVAILABLE: plt.show(block=False)
+        else:
+            pulse_len = len(solar_pulse.value) if hasattr(solar_pulse, 'value') else "N/A"
+            data_len = len(data_for_demos_ts.value) if hasattr(data_for_demos_ts, 'value') else "N/A"
+            print(f"Could not perform solar pulse injection due to length mismatch or empty data (data: {data_len}, pulse: {pulse_len}).")
+
+        # --- NEW: Provoke Xeno Collapse Layer & Map Boundary State ---
+        print("\n--- Optional (New): Provoked Xeno Layer Analysis ---")
+        epsilon_for_zeno_test = EPSILON_PHI_VALUE 
+        if sweep_run_results: 
+            for eps_val, res in sweep_run_results.items():
+                if res.get('epsilon_occurrences',0) > 0 and res.get('mean_ripple_deviation',0) > 0:
+                    epsilon_for_zeno_test = eps_val; break
+        
+        provoked_rd_opt_zeno = analyzer.optional_feature_analyzer.provoke_zeno_conditions_on_ripples(
+            rd_opt, rf_opt, epsilon_for_zeno_test, target_freq_range_hz=(min(rf_opt) if len(rf_opt)>0 else 50, 
+                                                                         max(rf_opt)*0.5 if len(rf_opt)>0 else 150)
+        )
+        
+        zeno_map_provoked = analyzer.optional_feature_analyzer.analyze_zeno_layer(
+            data_for_demos_ts, ripple_devs=provoked_rd_opt_zeno, ripple_freqs=rf_opt,
+            epsilon_threshold=epsilon_for_zeno_test 
+        )
+        
+        if np.any(zeno_map_provoked): 
+            print(f"  Provoked Zeno effect detected. Max suppression value: {np.max(zeno_map_provoked):.2e}")
+            boundary_state_info = analyzer.optional_feature_analyzer.map_zeno_boundary_state(
+                data_for_demos_ts, zeno_map_provoked, rf_opt, rd_opt, provoked_rd_opt_zeno
+            )
+            print(f"  Zeno Boundaries: Starts at times {boundary_state_info.get('starts_time', [])}, Ends at times {boundary_state_info.get('ends_time', [])}")
+            print(f"  Zeno Boundary Ripple Chars: {boundary_state_info.get('boundary_ripple_chars', {})}")
+
+            fig_zeno_provoked = analyzer.optional_feature_analyzer.plot_provoked_zeno_layer_results(
+                data_for_demos_ts, zeno_map_provoked, boundary_state_info, demo_data_name
+            )
+            if fig_zeno_provoked: fig_zeno_provoked.savefig('provoked_zeno_layer_analysis.png', dpi=150, facecolor='black'); 
+            if GWPY_AVAILABLE: plt.show(block=False)
+        else:
+            print("  Provoked Zeno effect was not significantly triggered with current parameters/data. Skipping plot.")
+
+        # --- NEW: HCE and Dark Matter/Energy through Morphic Fields ---
+        print("\n--- Optional (New): HCE & Dark Matter/Energy Effects ---")
+        
+        # Ensure rf_opt and rd_opt have values that will generate non-negligible HCE activity for this DM/DE demo.
+        force_active_dm_de_ripples = False
+        if rd_opt is None or len(rd_opt) == 0:
+            force_active_dm_de_ripples = True
+        else:
+            # Check if any finite ripple deviation is above the 0.01 threshold
+            valid_rd_opt_for_dm_de = rd_opt[np.isfinite(rd_opt) & (rd_opt > 0.01)]
+            if len(valid_rd_opt_for_dm_de) == 0:
+                force_active_dm_de_ripples = True
+        
+        if force_active_dm_de_ripples:
+            print("    Overriding/Setting rf_opt and rd_opt for DM/DE demonstration to ensure non-negligible HCE activity.")
+            rf_opt = np.array([60, 90, 130, 180, 240]) 
+            rd_opt = np.array([0.25, 0.75, 0.45, 0.85, 0.35]) # Ensures mean > 0.01
+
+        if data_for_demos_ts is not None and rf_opt is not None and len(rf_opt) > 0 and rd_opt is not None and len(rd_opt) > 0:
+            current_ripple_freqs = rf_opt
+            current_ripple_devs = rd_opt
+            
+            hce_dm_de_results = analyzer.optional_feature_analyzer.analyze_hce_dark_matter_energy_effects(
+                data_for_demos_ts, 
+                ripple_freqs=current_ripple_freqs, 
+                ripple_devs=current_ripple_devs,
+                base_event_name=demo_data_name
+            )
+            print(f"  HCE Activity Metric for DM/DE: {hce_dm_de_results['hce_activity_metric']:.2e}")
+            if np.any(hce_dm_de_results['dark_energy_contribution']) or np.any(hce_dm_de_results['dark_matter_potential_modification']):
+                print(f"  Max Conceptual DE Contribution: {np.max(hce_dm_de_results['dark_energy_contribution']):.2e}")
+                print(f"  Min Conceptual DM Potential Mod: {np.min(hce_dm_de_results['dark_matter_potential_modification']):.2e}")
+                fig_hce_dm_de = analyzer.optional_feature_analyzer.plot_hce_dark_matter_energy_effects(hce_dm_de_results)
+                if fig_hce_dm_de: 
+                    fig_hce_dm_de.savefig('hce_dark_matter_energy_effects.png', dpi=150, facecolor='black')
+                    if GWPY_AVAILABLE: plt.show(block=False)
+            else:
+                print("  Conceptual DM/DE effects from HCE were negligible with current data/parameters, despite forcing active ripples (check model logic if unexpected).")
+        else:
+            print("  Skipping HCE Dark Matter/Energy conceptual analysis: Insufficient data (demo_ts or ripple info).")
+
+
+    theoretical_discussion_text_block = """
+--- Theoretical Discussion: HyperMorphic Contextual Entanglement (HCE) ---
+
+This section outlines key theoretical questions and research directions related to
+HyperMorphic Contextual Entanglement (HCE) that this analytical framework aims to explore.
+Answers and further hypotheses would be developed based on experimental results and
+further theoretical work.
+
+Key Questions:
+
+1.  Can HCE be induced artificially in laboratory systems?
+    -   Hypothesis: Specific configurations of high-density, rapidly changing quantum fields,
+        or precisely tuned electromagnetic pulses within resonant cavities containing
+        exotic materials, might create localized HCE conditions.
+    -   Experimental Approach: Design experiments involving [e.g., Bose-Einstein condensates
+        subjected to complex EM fields, high-energy plasma interactions, metamaterial
+        structures interacting with entangled particle beams].
+    -   Observable Signatures: Look for anomalous energy fluctuations, non-local correlations
+        exceeding Bell's inequalities in unexpected ways, or transient changes in local
+        spacetime metrics (if measurable).
+
+2.  What is the relationship between HCE and consciousness?
+    -   Hypothesis: If consciousness arises from complex, highly integrated information
+        processing, HCE might provide a physical mechanism for non-local aspects of
+        consciousness or a deeper level of interconnectedness in neural processing.
+        This is highly speculative.
+    -   Research Direction: Explore if HCE-like patterns (e.g., specific ripple deviation
+        signatures, phase coherence anomalies) correlate with complex cognitive tasks or
+        states of heightened awareness in neurobiological data, if HCE can be linked to
+        quantum processes in the brain (e.g., Penrose-Hameroff Orch-OR theory, though controversial).
+    -   Challenges: Establishing a causal link would be extremely difficult. Correlation
+        does not imply causation. Defining and measuring "consciousness" operationally
+        is a major hurdle.
+
+3.  How does HCE interact with classical spacetime curvature?
+    -   Hypothesis: HCE might represent fine-grained, context-dependent modulations of
+        the quantum vacuum that, on a macroscopic scale, could subtly influence or be
+        influenced by classical spacetime curvature. It might manifest as localized,
+        transient deviations from expected General Relativity (GR) effects.
+    -   Theoretical Framework: Attempt to extend GR or quantum field theory in curved
+        spacetime to include HNum-like mathematical structures or context-dependent
+        vacuum states.
+    -   Potential Observations: Look for unexpected residuals in precision GR tests
+        (e.g., gravitational lensing, frame-dragging) in regions where HCE is theorized
+        to be strong (e.g., near massive compact objects, early universe).
+
+4.  Can HCE explain dark matter/energy through morphic field effects?
+    -   Hypothesis: The cumulative effect of HCE-induced morphic fields (if such fields
+        are a consequence of HCE) across cosmological scales might manifest as an
+        apparent gravitational effect mimicking dark matter, or as a pervasive vacuum
+        energy component contributing to cosmic acceleration (dark energy).
+    -   Model Development: Develop cosmological models where HCE-derived morphic fields
+        contribute to the universe's stress-energy tensor or modify gravitational laws
+        on large scales. (This script provides a toy model visualization for this concept).
+    -   Constraints: Models must be consistent with existing cosmological observations
+        (CMB, large-scale structure, Type Ia supernovae). This is a significant challenge.
+
+5.  What are the implications for quantum computing and cryptography?
+    -   Quantum Computing Hypothesis: If HCE allows for richer, context-dependent forms
+        of entanglement or non-local correlations, it might lead to new types of qubits
+        ("H-qubits") or quantum gates with enhanced computational power or resilience
+        to certain types of decoherence.
+    -   Research: Investigate if the HNum algebra can describe novel quantum states or
+        operations. Explore if systems exhibiting HCE signatures (even if simulated
+        initially) can solve problems intractable for standard quantum computers.
+    -   Cryptography Hypothesis: HCE might enable new cryptographic protocols based on
+        the difficulty of predicting or replicating specific contextual ripple patterns,
+        or by leveraging unique non-local correlations for key distribution or message
+        authentication.
+    -   Challenges: Physical realization of HCE-based quantum systems is a primary
+        obstacle. Theoretical security proofs for HCE-based cryptography would be needed.
+
+Further Research Areas:
+    -   Mathematical formalization of HCE within established physics frameworks.
+    -   Development of experimental protocols to detect or induce HCE.
+    -   Simulation of HCE effects in astrophysical and cosmological scenarios.
+    -   Exploration of HCE in condensed matter systems or high-energy physics.
+"""
+    print("\n\n=== All Demo Analyses Complete ===")
+    print("Optional features demonstrated with mock-ups or conceptual visualizations.")
+    print(theoretical_discussion_text_block)
+    if GWPY_AVAILABLE: plt.show()
+    else: print ("\n(Plots would be shown here if Matplotlib interactive backend was active and gwpy was fully available)")
+
+
