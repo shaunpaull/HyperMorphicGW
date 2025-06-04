@@ -1,0 +1,719 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D # For specific 3D plots if needed
+from scipy import signal
+from scipy.signal import stft # For STFT if used, though less emphasized here
+from scipy.ndimage import gaussian_filter
+import copy
+
+# --- Mock TimeSeries Class ---
+class MockTimeSeries:
+    def __init__(self, data, sample_rate=1.0, t0=0, name=None, times=None):
+        self.value = np.asarray(data)
+        self._name = name if name is not None else "MockTimeSeries"
+        self._t0 = t0
+        self._sample_rate_val = sample_rate
+
+        if times is not None:
+            self._times = np.asarray(times)
+            if len(self.value) != len(self._times) and len(self.value) > 0:
+                 raise ValueError("Length of data and times must match.")
+            if len(self.value) > 1 and self._times is not None and (self._times[1] - self._times[0] != 0):
+                 self._sample_rate_val = 1.0 / (self._times[1] - self._times[0])
+        elif self._sample_rate_val > 0 and len(self.value) > 0:
+            self._times = np.arange(len(self.value)) / self._sample_rate_val + self._t0
+        else:
+            self._times = np.array([])
+
+        self.name = self._name
+        class ValueWrapper: # Inner class to mimic gwpy's .value access
+            def __init__(self, val): self.value = val
+        self.sample_rate = ValueWrapper(self._sample_rate_val)
+        self.t0 = ValueWrapper(self._t0)
+        self.duration = ValueWrapper(len(self.value) / self._sample_rate_val if self._sample_rate_val > 0 and len(self.value) > 0 else 0)
+        self.times = ValueWrapper(self._times)
+
+    def __len__(self):
+        return len(self.value)
+
+# --- HyperMorphic Constants and Global Mode ---
+EPSILON_PHI_VALUE = 1e-50
+HYPERMORPHIC_MODE = "AdaptiveV13_Stronger" # Default mode, can be changed for tests
+
+# --- Core HNum and HyperMorphic Math (Adapted from provided codebase) ---
+class HNum:
+    def __init__(self, value, dimension=0):
+        self.dimension = dimension
+        current_epsilon_phi = EPSILON_PHI_VALUE
+
+        if isinstance(value, HNum):
+            self.value = value.value
+            self.is_epsilon = value.is_epsilon
+        elif isinstance(value, (int, float, complex)):
+            # Check if value is numerically close to EPSILON_PHI_VALUE
+            if abs(value - current_epsilon_phi) < current_epsilon_phi * 10:
+                self.value = complex(current_epsilon_phi, 0)
+                self.is_epsilon = True
+            # Check if value is numerically zero (becomes EPSILON_PHI_VALUE)
+            elif abs(value) < current_epsilon_phi * 0.001: # Threshold for treating as epsilon
+                 self.value = complex(current_epsilon_phi, 0)
+                 self.is_epsilon = True
+            else:
+                self.value = complex(value)
+                self.is_epsilon = False
+        elif isinstance(value, str) and value == "EPSILON_PHI":
+            self.value = complex(current_epsilon_phi, 0)
+            self.is_epsilon = True
+        else:
+            try: # Try to convert to complex, then check if it's effectively epsilon
+                val_complex = complex(value)
+                if abs(val_complex) < current_epsilon_phi * 0.001: # Threshold
+                    self.value = complex(current_epsilon_phi, 0)
+                    self.is_epsilon = True
+                else:
+                    self.value = val_complex
+                    self.is_epsilon = False
+            except (TypeError, ValueError):
+                raise ValueError(f"Cannot initialize HNum with value: {value} of type {type(value)}")
+
+    def _is_numerically_zero(self, val, tol_factor=0.001):
+        return abs(val) < (EPSILON_PHI_VALUE * tol_factor)
+
+    def __repr__(self):
+        if self.is_epsilon:
+            return f"HNum(ε_H@{EPSILON_PHI_VALUE:.0e}, dim={self.dimension})"
+        return f"HNum({self.value.real:.3e}{self.value.imag:+.3e}j, dim={self.dimension})"
+
+    def _prepare_operand(self, other):
+        if not isinstance(other, HNum):
+            # Operands inherit current HNum's dimension if not HNum themselves
+            return HNum(other, self.dimension)
+        return other
+
+    def _create_result(self, val, op_desc): # op_desc can be used for logging if needed
+        # Result HNum inherits dimension from self, or could be context-dependent
+        result = HNum(val, self.dimension)
+        return result
+
+    def add(self, other, op_ctx="add"):
+        other = self._prepare_operand(other)
+        if self.is_epsilon and other.is_epsilon:
+            # Sum of two epsilons is epsilon
+            return HNum("EPSILON_PHI", self.dimension)
+
+        raw_val = self.value + other.value
+        phi = phi_dynamic_base(self.dimension, abs(raw_val), op_ctx)
+
+        if self.is_epsilon and not other.is_epsilon:
+            result_val = complex_mod(other.value, phi)
+        elif not self.is_epsilon and other.is_epsilon:
+            result_val = complex_mod(self.value, phi)
+        elif self._is_numerically_zero(raw_val): # Sum results in numerical zero
+            return HNum("EPSILON_PHI", self.dimension)
+        else:
+            result_val = complex_mod(raw_val, phi)
+        return self._create_result(result_val, f"add({op_ctx})")
+
+    def multiply(self, other, op_ctx="mul"):
+        other = self._prepare_operand(other)
+        if self.is_epsilon or other.is_epsilon: # Multiplication by epsilon results in epsilon
+            return HNum("EPSILON_PHI", self.dimension)
+
+        raw_val = self.value * other.value
+        psi = psi_dynamic_modulus(self.dimension, abs(raw_val), op_ctx)
+        result_val = complex_mod(raw_val, psi)
+        if self._is_numerically_zero(result_val): # Product results in numerical zero
+             return HNum("EPSILON_PHI", self.dimension)
+        return self._create_result(result_val, f"mul({op_ctx})")
+
+    def subtract(self, other, op_ctx="sub"):
+        other = self._prepare_operand(other)
+        if self.is_epsilon and other.is_epsilon: # Epsilon minus epsilon is epsilon (conceptually zero flux)
+            return HNum("EPSILON_PHI", self.dimension)
+
+        raw_val = self.value - other.value
+        phi = phi_dynamic_base(self.dimension, abs(raw_val), op_ctx)
+
+        # If subtraction results in a value very close to zero
+        if abs(raw_val) < EPSILON_PHI_VALUE * 0.1: # More stringent check for subtraction to epsilon
+            return HNum("EPSILON_PHI", self.dimension)
+
+        result_val = complex_mod(raw_val, phi)
+        return self._create_result(result_val, f"sub({op_ctx})")
+
+    def divide(self, other, op_ctx="div"):
+        other = self._prepare_operand(other)
+        current_epsilon_phi = EPSILON_PHI_VALUE
+
+        if other.is_epsilon: # Division by epsilon
+            if self.is_epsilon: # Epsilon / Epsilon = 1 (conceptually)
+                raw_val = 1.0 + 0j # Or some other defined constant HNum
+            else: # Finite / Epsilon -> Large number, potentially unstable, map to a large HNum or error
+                  # For stability, let's assume it yields a large complex number if not epsilon.
+                  # The original code uses value / (epsilon+epsilon*j), which gives a large number.
+                raw_val = self.value / complex(current_epsilon_phi, current_epsilon_phi) # Avoid pure real/imag
+        elif self._is_numerically_zero(other.value): # Division by numerical zero that isn't epsilon
+            if self.is_epsilon: # Epsilon / "near-zero" -> Epsilon (small numerator)
+                return HNum("EPSILON_PHI", self.dimension)
+            else: # Finite / "near-zero" -> Large
+                raw_val = self.value / complex(current_epsilon_phi, current_epsilon_phi) # Treat divisor as epsilon proxy
+        elif self.is_epsilon: # Epsilon / Finite -> Epsilon
+            return HNum("EPSILON_PHI", self.dimension)
+        else:
+            raw_val = self.value / other.value
+
+        psi = psi_dynamic_modulus(self.dimension, abs(raw_val), op_ctx)
+        result_val = complex_mod(raw_val, psi)
+
+        if self._is_numerically_zero(result_val): # If result of division is numerically zero
+            return HNum("EPSILON_PHI", self.dimension)
+        return self._create_result(result_val, f"div({op_ctx})")
+
+    def abs_H(self): # Hypermorphic Absolute Value
+        if self.is_epsilon:
+            return HNum("EPSILON_PHI", self.dimension)
+        # The absolute value of an HNum is an HNum representing its magnitude.
+        # The dimension could be preserved or reset, let's preserve it.
+        return HNum(abs(self.value), self.dimension)
+
+def complex_mod(z, N):
+    if not isinstance(N, (int, float, np.number)) or N == 0:
+        if N == 0: return complex(0,0) # Mod by zero is problematic, return zero
+        N_abs = abs(N) # Use absolute value of N if N is complex
+        if N_abs == 0: return complex(0,0)
+        N = N_abs # N must be a positive real for fmod
+
+    if N < 0: N = abs(N) # Ensure N is positive
+    if N == 0: return complex(0,0) # Should be caught above, but defensively
+
+    real_part = np.fmod(z.real, N)
+    imag_part = np.fmod(z.imag, N)
+    return complex(real_part, imag_part)
+
+def phi_dynamic_base(dimension, current_val_magnitude, op_context):
+    global HYPERMORPHIC_MODE
+    if HYPERMORPHIC_MODE == "ClassicalMimicry": return int(1e18) # Large number to make modulo ineffective
+    elif HYPERMORPHIC_MODE == "Aggressive": # Simplified for these theoretical tests
+        base_val = 5 + dimension % 3 # Simpler dependency on dimension
+        mag_factor = np.log1p(current_val_magnitude) * 0.1 # Softer magnitude dependency
+        return max(1, int(np.round(base_val + mag_factor)))
+    elif HYPERMORPHIC_MODE == "AdaptiveV13_Stronger": # Keep original for comparison if needed
+        if dimension == 0: # More sensitive for base dimension
+            base_val = 10 + (current_val_magnitude ** 1.8) + current_val_magnitude * 200
+            base_val += np.log1p(current_val_magnitude) * 10
+        else:
+            base_val = 10 + dimension + 3 * np.sin(dimension * 0.3) # Includes oscillation
+            base_val += np.log1p(current_val_magnitude) * (dimension + 1) # Interaction
+            base_val += (current_val_magnitude ** 1.5) # Stronger mag dependency
+            base_val += current_val_magnitude * ((dimension * 0.1) + 0.2) # Linear mag dependency
+        return max(1, int(np.round(base_val)))
+    else: return 100 # Default fallback
+
+def psi_dynamic_modulus(dimension, current_val_magnitude, op_context):
+    global HYPERMORPHIC_MODE
+    if HYPERMORPHIC_MODE == "ClassicalMimicry": return int(1e18)
+    elif HYPERMORPHIC_MODE == "Aggressive": # Simplified
+        mod_val = 7 + dimension % 5
+        mag_factor = np.log1p(current_val_magnitude) * 0.2
+        return max(1, int(np.round(mod_val + mag_factor)))
+    elif HYPERMORPHIC_MODE == "AdaptiveV13_Stronger": # Keep original
+        if dimension == 0:
+            mod_val = 150 + (current_val_magnitude ** 1.8) + current_val_magnitude * 100
+            mod_val += np.log1p(current_val_magnitude) * 2.5
+        else:
+            mod_val = 15 + dimension * 2 + 4 * np.cos(dimension * 0.2)
+            mod_val += np.log1p(current_val_magnitude) * 0.5 * (dimension + 2)
+            mod_val += (current_val_magnitude ** 1.2)
+            mod_val += current_val_magnitude * (dimension * 0.05 + 0.1)
+        return max(1, int(np.round(mod_val)))
+    else: return 150 # Default
+
+def hypermorphic_transform(data_input_raw, dimension=0, sample_dim_factor=10):
+    h_data = []
+    raw_values = data_input_raw # Expects a 1D numpy array or list
+    for i, val in enumerate(raw_values):
+        # Dimension can vary per sample for richer context
+        dim = dimension + (i % sample_dim_factor)
+        h_val = HNum(val, dim)
+        h_data.append(h_val)
+    return h_data
+
+def hypermorphic_fft(h_data_input):
+    n = len(h_data_input)
+    if n == 0: return []
+    h_fft_output = []
+    for k in range(n // 2): # Calculate for positive frequencies (up to Nyquist)
+        sum_h = HNum(0, k) # Assign dimension to the sum based on frequency bin k
+        for j in range(n):
+            angle = -2 * np.pi * k * j / n
+            twiddle_val = complex(np.cos(angle), np.sin(angle))
+            # Dimension for twiddle factor can also be context-dependent
+            h_twiddle = HNum(twiddle_val, dimension=(k + j) % 10) # Example context for twiddle
+            contrib = h_data_input[j].multiply(h_twiddle, op_ctx=f"fft_k{k}_j{j}")
+            sum_h = sum_h.add(contrib, op_ctx=f"fft_sum_k{k}")
+        h_fft_output.append(sum_h)
+    return h_fft_output
+
+def detect_context_ripples(h_fft_output, classical_fft_segment_input, sample_rate_val=1.0, N_total_samples_classical=None):
+    deviations = []
+    frequencies = []
+    
+    len_classical_fft_segment = len(classical_fft_segment_input)
+    if len_classical_fft_segment == 0 or not h_fft_output or len(h_fft_output) == 0:
+        return np.array(frequencies), np.array(deviations)
+
+    num_freq_bins_to_compare = min(len(h_fft_output), len_classical_fft_segment)
+    
+    if N_total_samples_classical is None:
+        # Infer N from the length of the one-sided classical FFT segment
+        # This assumes classical_fft_segment_input contains N/2 points
+        N_total_samples_classical = 2 * len_classical_fft_segment if len_classical_fft_segment > 0 else 1
+    if N_total_samples_classical == 0: N_total_samples_classical = 1 # Avoid division by zero
+
+    for k in range(num_freq_bins_to_compare):
+        if k >= len(h_fft_output) or k >= len(classical_fft_segment_input): continue
+            
+        h_val_complex = h_fft_output[k].value
+        c_val_complex = classical_fft_segment_input[k]
+        h_abs = abs(h_val_complex)
+        c_abs = abs(c_val_complex)
+
+        if c_abs > 1e-30: 
+            dev = abs(h_abs - c_abs) / c_abs
+            deviations.append(dev)
+            frequencies.append(k * sample_rate_val / N_total_samples_classical)
+    return np.array(frequencies), np.array(deviations)
+
+# --- Plotting Configuration ---
+plt.style.use('dark_background')
+electric_purple = '#BF40BF'
+electric_blue = '#00FFFF'
+neon_pink = '#FF10F0'
+lime_green = '#ADFF2F'
+gold_yellow = '#FFD700'
+
+def setup_ax_style(ax, title):
+    ax.set_facecolor('black')
+    ax.grid(True, alpha=0.2, color=electric_purple, linestyle=':')
+    for spine in ax.spines.values():
+        spine.set_color(electric_purple)
+    ax.tick_params(colors=electric_blue)
+    ax.xaxis.label.set_color(electric_blue)
+    ax.yaxis.label.set_color(electric_blue)
+    ax.title.set_color(electric_purple)
+    ax.set_title(title, fontsize=14)
+
+# --- Theoretical Test Functions ---
+
+def test_q1_induce_hce_artificially(sample_rate=1000, duration=1.0):
+    print("\n--- Q1: Inducing HCE Artificially ---")
+    num_samples = int(sample_rate * duration)
+    t = np.linspace(0, duration, num_samples, endpoint=False)
+
+    baseline_signal_raw = 0.5 * np.sin(2 * np.pi * 10 * t) + 0.2 * np.sin(2 * np.pi * 30 * t)
+    pulse = 2.0 * np.exp(-((t - duration * 0.5)**2) / (2 * (duration * 0.05)**2))
+    pulse *= np.sin(2 * np.pi * 50 * t + np.pi * (t/(duration+1e-9))**2 )
+    perturbed_signal_raw = baseline_signal_raw + pulse
+    
+    N_baseline = len(baseline_signal_raw)
+    h_baseline_transformed = hypermorphic_transform(baseline_signal_raw, dimension=0)
+    h_fft_baseline = hypermorphic_fft(h_baseline_transformed)
+    c_fft_baseline_segment = np.fft.fft(baseline_signal_raw)[:len(h_fft_baseline)]
+    freq_base, dev_base = detect_context_ripples(h_fft_baseline, c_fft_baseline_segment, sample_rate, N_total_samples_classical=N_baseline)
+
+    N_perturbed = len(perturbed_signal_raw)
+    h_perturbed_transformed = hypermorphic_transform(perturbed_signal_raw, dimension=10)
+    h_fft_perturbed = hypermorphic_fft(h_perturbed_transformed)
+    c_fft_perturbed_segment = np.fft.fft(perturbed_signal_raw)[:len(h_fft_perturbed)]
+    freq_pert, dev_pert = detect_context_ripples(h_fft_perturbed, c_fft_perturbed_segment, sample_rate, N_total_samples_classical=N_perturbed)
+
+    corr_segment_len = min(100, num_samples // 10 if num_samples // 10 >=10 else 10)
+    h_system_A_series = [HNum(val, dimension=i%5) for i, val in enumerate(baseline_signal_raw[:corr_segment_len])]
+    h_system_B_series = []
+    coupling_param = HNum(0.5, dimension=50)
+    for i in range(len(h_system_A_series)):
+        context_shift_val = np.sin(i * 0.1 + t[i]*0.5)
+        context_shift_hnum = HNum(context_shift_val, dimension=50 + i%3)
+        modified_A_by_context = h_system_A_series[i].add(context_shift_hnum, op_ctx="coupling_context_add")
+        h_system_B_series.append(modified_A_by_context.multiply(coupling_param, op_ctx="coupling_mult"))
+    A_vals_real = np.array([h.value.real for h in h_system_A_series])
+    B_vals_real = np.array([h.value.real for h in h_system_B_series])
+    classical_B_vals_real = A_vals_real * 0.5
+
+    fig, axs = plt.subplots(3, 1, figsize=(12, 15), constrained_layout=True)
+    fig.suptitle("Q1: Inducing HCE Artificially (Conceptual)", fontsize=16, color=electric_purple)
+
+    setup_ax_style(axs[0], "Signal & Induced HCE Ripples")
+    axs[0].plot(t, baseline_signal_raw, label='Baseline Signal', color='gray', alpha=0.7)
+    axs[0].plot(t, perturbed_signal_raw, label='Perturbed Signal (Pulse Applied)', color=electric_blue, lw=1.5)
+    ax0_twin = axs[0].twinx()
+    if len(freq_base) > 0 : ax0_twin.plot(freq_base, dev_base, label='Baseline Ripples', color=lime_green, linestyle=':', marker='.', alpha=0.6)
+    if len(freq_pert) > 0 : ax0_twin.plot(freq_pert, dev_pert, label='Perturbed Ripples (HCE)', color=neon_pink, marker='x', alpha=0.8)
+    axs[0].set_xlabel("Time (s)")
+    axs[0].set_ylabel("Signal Amplitude")
+    ax0_twin.set_ylabel("Ripple Deviation (Log)", color=neon_pink)
+    ax0_twin.set_xlabel("Frequency (Hz) for Ripples", color=neon_pink) # Label for twin axis
+    if (len(dev_pert) > 0 and np.any(np.isfinite(dev_pert))) or \
+       (len(dev_base) > 0 and np.any(np.isfinite(dev_base))): 
+        ax0_twin.set_yscale('log')
+    lines, labels = axs[0].get_legend_handles_labels()
+    lines2, labels2 = ax0_twin.get_legend_handles_labels()
+    if labels or labels2 : ax0_twin.legend(lines + lines2, labels + labels2, loc='upper right')
+
+    setup_ax_style(axs[1], "Anomalous Energy Fluctuation (Conceptual H-Energy Spectrum)")
+    energy_baseline_h = [abs(h.value)**2 for h in h_fft_baseline]
+    energy_perturbed_h = [abs(h.value)**2 for h in h_fft_perturbed]
+    freq_axis_energy = np.linspace(0, sample_rate/2, len(h_fft_baseline), endpoint=False) if len(h_fft_baseline) > 0 else np.array([])
+    if len(freq_axis_energy) == len(energy_baseline_h):
+        axs[1].plot(freq_axis_energy, energy_baseline_h, label='Baseline H-Energy Spectrum', color=lime_green, alpha=0.7)
+    if len(freq_axis_energy) == len(energy_perturbed_h):
+        axs[1].plot(freq_axis_energy, energy_perturbed_h, label='Perturbed H-Energy (HCE)', color=neon_pink, lw=1.5)
+    axs[1].set_xlabel("Frequency (Hz)")
+    axs[1].set_ylabel("Conceptual H-Energy (Log Scale)")
+    if (len(energy_baseline_h) > 0 and np.any(np.isfinite(energy_baseline_h))) or \
+       (len(energy_perturbed_h) > 0 and np.any(np.isfinite(energy_perturbed_h))):
+        axs[1].set_yscale('log')
+    axs[1].legend()
+
+    setup_ax_style(axs[2], "Non-Local Correlation via HCE (Conceptual)")
+    if len(A_vals_real) > 0:
+        time_corr_plot = np.arange(len(A_vals_real))
+        axs[2].plot(time_corr_plot, A_vals_real, label='System A (HNum Real Part)', color=electric_blue, linestyle='--')
+        axs[2].plot(time_corr_plot, classical_B_vals_real, label='System B (Classical Coupling)', color='gray', alpha=0.7)
+        axs[2].plot(time_corr_plot, B_vals_real, label='System B (HCE Coupling)', color=gold_yellow, lw=1.5)
+    axs[2].set_xlabel("Time Step (Correlation Segment)")
+    axs[2].set_ylabel("State Value (Real Part)")
+    axs[2].legend()
+    
+    plt.savefig("hce_q1_induce_hce.png", dpi=150, facecolor='black')
+    print("  Q1 visualization saved to hce_q1_induce_hce.png")
+
+def test_q2_hce_consciousness(sample_rate=100, duration=10.0):
+    print("\n--- Q2: HCE and Consciousness (Speculative) ---")
+    num_samples = int(sample_rate * duration)
+    t = np.linspace(0, duration, num_samples, endpoint=False)
+    neural_signal_base = np.sin(2 * np.pi * 1 * t) + 0.5 * np.sin(2 * np.pi * 2.5 * t)
+    noise = 0.1 * np.random.randn(num_samples)
+    neural_signal_raw = neural_signal_base + noise
+    cognitive_load_profile = 20 * (1 - np.exp(-0.5 * t)) + 0.5 * np.sin(t*0.7)
+    load_levels_str = ['Low Load', 'Medium Load', 'High Load']
+    time_segments_for_load = [(0, duration/3), (duration/3, 2*duration/3), (2*duration/3, duration)]
+    mean_ripple_by_load_level = []
+
+    for i, (start_time, end_time) in enumerate(time_segments_for_load):
+        start_idx = np.where(t >= start_time)[0][0]
+        end_idx = np.where(t < end_time)[0][-1] + 1 if len(np.where(t < end_time)[0]) > 0 else num_samples
+        segment_data_raw = neural_signal_raw[start_idx:end_idx]
+        segment_cognitive_load = cognitive_load_profile[start_idx:end_idx]
+        N_segment = len(segment_data_raw)
+        if N_segment < 4 : 
+            mean_ripple_by_load_level.append(0)
+            continue
+        avg_load_in_segment = np.mean(segment_cognitive_load)
+        segment_h_data = hypermorphic_transform(segment_data_raw, dimension=int(avg_load_in_segment))
+        h_fft_seg = hypermorphic_fft(segment_h_data)
+        c_fft_seg = np.fft.fft(segment_data_raw)[:len(h_fft_seg)]
+        _, dev_seg = detect_context_ripples(h_fft_seg, c_fft_seg, sample_rate, N_total_samples_classical=N_segment)
+        finite_dev_seg = dev_seg[np.isfinite(dev_seg)]
+        mean_ripple_by_load_level.append(np.mean(finite_dev_seg) if len(finite_dev_seg) > 0 else 0)
+
+    fig, axs = plt.subplots(2, 1, figsize=(12, 10), sharex=False, constrained_layout=True)
+    fig.suptitle("Q2: HCE and Consciousness (Speculative Correlation)", fontsize=16, color=electric_purple)
+    setup_ax_style(axs[0], "Synthetic Neural Activity and Cognitive Load")
+    axs[0].plot(t, neural_signal_raw, label='Neural Activity (Raw)', color=electric_blue, alpha=0.8)
+    axs[0].set_ylabel("Neural Signal Amplitude", color=electric_blue)
+    axs[0].set_xlabel("Time (s)")
+    ax0_twin = axs[0].twinx()
+    ax0_twin.plot(t, cognitive_load_profile, label='Cognitive Load (Affects H-Dimension)', color=lime_green, linestyle='--')
+    ax0_twin.set_ylabel("Cognitive Load / H-Dimension Proxy", color=lime_green)
+    lines, labels = axs[0].get_legend_handles_labels()
+    lines2, labels2 = ax0_twin.get_legend_handles_labels()
+    if labels or labels2: ax0_twin.legend(lines + lines2, labels + labels2, loc='upper right')
+
+    setup_ax_style(axs[1], "HCE Ripple Signature vs. Cognitive Load Epoch")
+    if mean_ripple_by_load_level:
+        axs[1].bar(load_levels_str, mean_ripple_by_load_level, color=neon_pink, alpha=0.7, label='Avg. HCE Ripple Deviation')
+        axs[1].set_ylabel("Avg. HCE Ripple Deviation (Log Scale)")
+        if any(m > 0 for m in mean_ripple_by_load_level if np.isfinite(m)): axs[1].set_yscale('log')
+        axs[1].legend()
+    else:
+        axs[1].text(0.5, 0.5, "Ripple analysis data not available.", transform=axs[1].transAxes, ha="center", color="gray")
+    axs[1].set_xlabel("Cognitive Load Epoch")
+    plt.savefig("hce_q2_consciousness.png", dpi=150, facecolor='black')
+    print("  Q2 visualization saved to hce_q2_consciousness.png")
+
+def test_q3_hce_spacetime_curvature(grid_size=50):
+    print("\n--- Q3: HCE and Spacetime Curvature (Conceptual) ---")
+    x_coords = np.linspace(-5, 5, grid_size)
+    y_coords = np.linspace(-5, 5, grid_size)
+    X, Y = np.meshgrid(x_coords, y_coords)
+    R = np.sqrt(X**2 + Y**2)
+    classical_potential = -1 / (R + 1e-3) 
+    classical_potential = np.clip(classical_potential, -10, 0)
+    signal_len_for_hce_map = grid_size * 2
+    time_signal_hce = np.linspace(0, 1, signal_len_for_hce_map)
+    raw_signal_for_hce_map = np.sin(2*np.pi*5*time_signal_hce)*np.exp(-(time_signal_hce-0.5)**2/0.1) + \
+                             0.5*np.sin(2*np.pi*15*time_signal_hce)*(1-time_signal_hce)
+    h_transformed_for_map = hypermorphic_transform(raw_signal_for_hce_map, dimension=30, sample_dim_factor=5)
+    hce_activity_1d = np.array([abs(h.value) for h in h_transformed_for_map])
+    hce_perturbation_field = np.zeros_like(classical_potential)
+    for i in range(grid_size):
+        activity_slice_indices = np.linspace(0, len(hce_activity_1d)-1, grid_size, dtype=int)
+        row_perturb_pattern = hce_activity_1d[activity_slice_indices]
+        row_perturb_pattern = (row_perturb_pattern / (np.max(hce_activity_1d) + 1e-9)) 
+        hce_perturbation_field[i, :] = row_perturb_pattern * \
+                                       (np.sin(2*np.pi*X[i,:]/3 + i*np.pi/grid_size*2) * \
+                                        np.cos(2*np.pi*Y[i,:]/4)) * 0.5
+    hce_perturbation_field = gaussian_filter(hce_perturbation_field, sigma=1.5)
+    total_potential = classical_potential + hce_perturbation_field * 0.2
+
+    fig, axs = plt.subplots(1, 3, figsize=(18, 6.5), constrained_layout=True)
+    fig.suptitle("Q3: HCE Interaction with Spacetime Curvature (Conceptual)", fontsize=16, color=electric_purple)
+    titles = ["Classical Potential", "HCE Perturbation Field", "Total (Modulated) Potential"]
+    data_to_plot = [classical_potential, hce_perturbation_field, total_potential]
+    cmaps = ['viridis', 'magma', 'plasma']
+    for i, ax in enumerate(axs):
+        setup_ax_style(ax, titles[i])
+        im = ax.imshow(data_to_plot[i], origin='lower', cmap=cmaps[i], extent=[x_coords.min(), x_coords.max(), y_coords.min(), y_coords.max()])
+        ax.set_xlabel("Spatial X"); ax.set_ylabel("Spatial Y")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.outline.set_edgecolor(electric_purple); cbar.ax.tick_params(colors=electric_blue)
+    plt.savefig("hce_q3_spacetime_curvature.png", dpi=150, facecolor='black')
+    print("  Q3 visualization saved to hce_q3_spacetime_curvature.png")
+
+def test_q4_hce_dark_matter_energy(sample_rate=1000, duration=1.0):
+    print("\n--- Q4: HCE and Dark Matter/Energy (Conceptual) ---")
+    num_samples = int(sample_rate * duration)
+    t_coords = np.linspace(0, duration, num_samples, endpoint=False)
+    base_signal_data = 0.7*np.sin(2*np.pi*(20 + 30*(t_coords/duration)**2)*t_coords)*(0.5 + 0.5*(t_coords/duration)) + \
+                       0.3*np.cos(2*np.pi*50*t_coords)*np.exp(-5*(t_coords - 0.5*duration)**2/(0.1*duration**2))
+    base_signal_ts = MockTimeSeries(base_signal_data, sample_rate=sample_rate, t0=0, name="CosmicSignalEvent")
+    N_signal = len(base_signal_ts.value)
+    h_transformed_signal = hypermorphic_transform(base_signal_ts.value, dimension=40)
+    h_fft_out = hypermorphic_fft(h_transformed_signal)
+    c_fft_segment = np.fft.fft(base_signal_ts.value)[:len(h_fft_out)]
+    ripple_freqs, ripple_devs = detect_context_ripples(h_fft_out, c_fft_segment, base_signal_ts.sample_rate.value, N_total_samples_classical=N_signal)
+    dm_de_results = {'time': base_signal_ts.times.value, 'original_strain': base_signal_ts.value,
+                     'morphic_field_strength_profile': np.zeros_like(base_signal_ts.value),
+                     'dark_energy_contribution': np.zeros_like(base_signal_ts.value),
+                     'dark_matter_potential_modification': np.zeros_like(base_signal_ts.value),
+                     'hce_activity_metric': 0.0}
+    if ripple_devs is not None and len(ripple_devs) > 0:
+        valid_ripple_devs = ripple_devs[np.isfinite(ripple_devs) & (ripple_devs > 0.01)] 
+        hce_activity_metric = np.mean(valid_ripple_devs) if len(valid_ripple_devs) > 0 else 0.0
+    else: hce_activity_metric = 0.0
+    dm_de_results['hce_activity_metric'] = hce_activity_metric
+    if len(base_signal_ts.value) > 0:
+        signal_envelope = np.abs(signal.hilbert(base_signal_ts.value))
+        signal_envelope_norm = signal_envelope / (np.max(signal_envelope) + 1e-12) 
+        morphic_field_strength = hce_activity_metric * signal_envelope_norm * 1e-2 
+        dm_de_results['morphic_field_strength_profile'] = morphic_field_strength
+        de_factor_coeff = 0.5
+        de_contribution_val = de_factor_coeff * hce_activity_metric * np.mean(morphic_field_strength) 
+        dm_de_results['dark_energy_contribution'] = np.full_like(base_signal_ts.value, de_contribution_val)
+        dm_factor_coeff = -1.0
+        if np.any(morphic_field_strength > 1e-5): 
+            peak_idx = np.argmax(morphic_field_strength)
+            t_indices_dm = np.arange(len(base_signal_ts.value))
+            sigma_potential_dm = len(base_signal_ts.value) / 8.0 
+            gaussian_potential_profile = np.exp(-((t_indices_dm - peak_idx)**2) / (2 * sigma_potential_dm**2))
+            dm_potential_mod = dm_factor_coeff * np.max(morphic_field_strength) * gaussian_potential_profile
+            dm_de_results['dark_matter_potential_modification'] = dm_potential_mod
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True, constrained_layout=True)
+    fig.suptitle(f'Q4: HCE Dark Matter/Energy Morphic Field Effects (Conceptual)', fontsize=16, color=electric_purple)
+    time_plot_vals=dm_de_results['time']; original_strain_plot_vals=dm_de_results['original_strain']
+    morphic_field_plot_vals=dm_de_results['morphic_field_strength_profile']
+    de_effect_plot_vals=dm_de_results['dark_energy_contribution']; dm_effect_plot_vals=dm_de_results['dark_matter_potential_modification']
+    hce_activity_metric_plot_val=dm_de_results['hce_activity_metric']
+    ax=axes[0]; setup_ax_style(ax, f'Signal & Conceptual Morphic Field (HCE Activity: {hce_activity_metric_plot_val:.2e})')
+    ax.plot(time_plot_vals, original_strain_plot_vals, color=electric_blue, label='Original Signal Strain', alpha=0.7, zorder=1)
+    ax.set_ylabel('Strain', color=electric_blue)
+    ax_twin0=ax.twinx()
+    ax_twin0.plot(time_plot_vals, morphic_field_plot_vals, color=gold_yellow, label='Morphic Field Strength Profile', linestyle='--', zorder=2)
+    ax_twin0.set_ylabel('Morphic Field (Rel. Strength)', color=gold_yellow); ax_twin0.tick_params(axis='y', labelcolor=gold_yellow)
+    if np.any(morphic_field_plot_vals): ax_twin0.set_ylim(bottom=0, top=np.max(morphic_field_plot_vals)*1.1 if np.max(morphic_field_plot_vals)>0 else 1e-3)
+    lines0,labels0=ax.get_legend_handles_labels(); lines_twin0,labels_twin0=ax_twin0.get_legend_handles_labels()
+    if labels0 or labels_twin0: ax_twin0.legend(lines0+lines_twin0, labels0+labels_twin0, loc='upper right')
+    ax=axes[1]; setup_ax_style(ax, 'Conceptual Dark Energy Contribution via HCE')
+    ax.plot(time_plot_vals, de_effect_plot_vals, color=lime_green, label='Dark Energy Contribution (Conceptual Shift)')
+    ax.set_ylabel('Δ Vacuum Energy (Conceptual)', color=lime_green)
+    if np.any(de_effect_plot_vals): min_de,max_de=np.min(de_effect_plot_vals),np.max(de_effect_plot_vals); ax.set_ylim(min_de-abs(min_de)*0.1 if min_de!=0 else -1e-3, max_de+abs(max_de)*0.1 if max_de!=0 else 1e-3)
+    else: ax.text(0.5,0.5,"Negligible DE effect",color="gray",ha="center",va="center",transform=ax.transAxes)
+    ax.legend()
+    ax=axes[2]; setup_ax_style(ax, 'Conceptual Dark Matter Potential Modification via HCE')
+    ax.plot(time_plot_vals, dm_effect_plot_vals, color=neon_pink, label='Dark Matter Potential Mod. (Conceptual)')
+    ax.set_ylabel('Δ Grav. Potential (Conceptual)', color=neon_pink)
+    if np.any(dm_effect_plot_vals): min_dm,max_dm=np.min(dm_effect_plot_vals),np.max(dm_effect_plot_vals); ax.set_ylim(min_dm-abs(min_dm)*0.1 if min_dm!=0 else -1e-3, max_dm+abs(max_dm)*0.1 if max_dm!=0 else 1e-3)
+    else: ax.text(0.5,0.5,"Negligible DM effect",color="gray",ha="center",va="center",transform=ax.transAxes)
+    ax.set_xlabel('Time (s)'); ax.legend()
+    plt.savefig("hce_q4_dark_matter_energy.png", dpi=150, facecolor='black')
+    print("  Q4 visualization saved to hce_q4_dark_matter_energy.png")
+
+def test_q5_hce_quantum_computing_crypto(num_q_ops=20, crypto_signal_len=128):
+    print("\n--- Q5: HCE for Quantum Computing & Cryptography (Conceptual) ---")
+    h_alpha_init = HNum(1/np.sqrt(2)+0j, dimension=0); h_beta_init = HNum(1/np.sqrt(2)+0j, dimension=1)
+    h_alpha_current = copy.deepcopy(h_alpha_init); h_beta_current = copy.deepcopy(h_beta_init)
+    h_state_evolution_alpha_probs = [abs(h_alpha_current.value)**2]; h_state_evolution_beta_probs = [abs(h_beta_current.value)**2]
+    def h_gate_contextual_phase(h_input, op_idx):
+        phase_angle = (h_input.dimension*0.1)+(op_idx*0.05); phase_factor_val = complex(np.cos(phase_angle),np.sin(phase_angle))
+        h_phase_factor = HNum(phase_factor_val, dimension=(10+op_idx+h_input.dimension)%15)
+        return h_input.multiply(h_phase_factor, op_ctx=f"HGate_Phase_op{op_idx}")
+    def h_gate_contextual_mix(h_a, h_b, op_idx):
+        mix_angle = 0.2+(h_a.dimension*0.02)-(h_b.dimension*0.01)+(op_idx*0.03)
+        mix_cos_val=np.cos(mix_angle); mix_sin_val=np.sin(mix_angle)
+        h_mix_cos=HNum(mix_cos_val,dimension=(20+op_idx+h_a.dimension)%12); h_mix_sin=HNum(mix_sin_val,dimension=(21+op_idx+h_b.dimension)%12)
+        h_minus_one=HNum(-1.0,dimension=22)
+        term_a1=h_a.multiply(h_mix_cos); term_a2=h_b.multiply(h_mix_sin); h_a_new=term_a1.add(term_a2)
+        term_b1=h_a.multiply(h_mix_sin).multiply(h_minus_one); term_b2=h_b.multiply(h_mix_cos); h_b_new=term_b1.add(term_b2)
+        return h_a_new, h_b_new
+    for op_i in range(num_q_ops):
+        h_alpha_current=h_gate_contextual_phase(h_alpha_current, op_i); h_beta_current=h_gate_contextual_phase(h_beta_current, op_i)
+        h_alpha_current,h_beta_current = h_gate_contextual_mix(h_alpha_current,h_beta_current,op_i)
+        mag_a_sq=abs(h_alpha_current.value)**2; mag_b_sq=abs(h_beta_current.value)**2; current_norm_factor_val=np.sqrt(mag_a_sq+mag_b_sq)
+        if current_norm_factor_val > 1e-9:
+            h_norm_divisor=HNum(current_norm_factor_val,dimension=h_alpha_current.dimension)
+            h_alpha_current=h_alpha_current.divide(h_norm_divisor)
+            h_norm_divisor_beta=HNum(current_norm_factor_val,dimension=h_beta_current.dimension)
+            h_beta_current=h_beta_current.divide(h_norm_divisor_beta)
+        h_state_evolution_alpha_probs.append(abs(h_alpha_current.value)**2); h_state_evolution_beta_probs.append(abs(h_beta_current.value)**2)
+    
+    base_crypto_signal_raw = np.random.rand(crypto_signal_len)*0.1
+    alice_key_dim_offset=50; alice_key_sample_dim_factor=7
+    N_crypto = len(base_crypto_signal_raw)
+    h_data_alice = hypermorphic_transform(base_crypto_signal_raw,dimension=alice_key_dim_offset,sample_dim_factor=alice_key_sample_dim_factor)
+    h_fft_alice = hypermorphic_fft(h_data_alice); c_fft_crypto_segment=np.fft.fft(base_crypto_signal_raw)[:len(h_fft_alice)]
+    freq_alice,dev_alice = detect_context_ripples(h_fft_alice,c_fft_crypto_segment,sample_rate_val=float(crypto_signal_len), N_total_samples_classical=N_crypto)
+    bob_key_dim_offset=50; bob_key_sample_dim_factor=7
+    h_data_bob = hypermorphic_transform(base_crypto_signal_raw,dimension=bob_key_dim_offset,sample_dim_factor=bob_key_sample_dim_factor)
+    h_fft_bob = hypermorphic_fft(h_data_bob)
+    freq_bob,dev_bob = detect_context_ripples(h_fft_bob,c_fft_crypto_segment,sample_rate_val=float(crypto_signal_len), N_total_samples_classical=N_crypto)
+    eve_key_dim_offset=51; eve_key_sample_dim_factor=7
+    h_data_eve = hypermorphic_transform(base_crypto_signal_raw,dimension=eve_key_dim_offset,sample_dim_factor=eve_key_sample_dim_factor)
+    h_fft_eve = hypermorphic_fft(h_data_eve)
+    freq_eve,dev_eve = detect_context_ripples(h_fft_eve,c_fft_crypto_segment,sample_rate_val=float(crypto_signal_len), N_total_samples_classical=N_crypto)
+
+    fig,axs=plt.subplots(2,1,figsize=(12,12),constrained_layout=True)
+    fig.suptitle("Q5: HCE in Quantum Computing & Cryptography (Conceptual)",fontsize=16,color=electric_purple)
+    setup_ax_style(axs[0],"H-Qubit State Evolution (Conceptual Probabilities)")
+    op_steps_plot=np.arange(num_q_ops+1)
+    axs[0].plot(op_steps_plot,h_state_evolution_alpha_probs,label='Prob(|α H-state|²)',color=electric_blue,marker='o',linestyle='-')
+    axs[0].plot(op_steps_plot,h_state_evolution_beta_probs,label='Prob(|β H-state|²)',color=neon_pink,marker='x',linestyle='--')
+    sum_probs=np.array(h_state_evolution_alpha_probs)+np.array(h_state_evolution_beta_probs)
+    axs[0].plot(op_steps_plot,sum_probs,label='Sum of Probs (Conceptual)',color='grey',linestyle=':',alpha=0.7)
+    axs[0].set_xlabel("Operation Step"); axs[0].set_ylabel("Probability (Conceptual)"); axs[0].set_ylim(-0.1,1.5); axs[0].legend()
+    setup_ax_style(axs[1],"HCE Ripple Pattern Sensitivity for Cryptography")
+    valid_arrays_crypto=[]; 
+    if dev_alice is not None and len(dev_alice)>0: valid_arrays_crypto.append(len(dev_alice))
+    if dev_bob is not None and len(dev_bob)>0: valid_arrays_crypto.append(len(dev_bob))
+    if dev_eve is not None and len(dev_eve)>0: valid_arrays_crypto.append(len(dev_eve))
+    min_plot_len_crypto = min(valid_arrays_crypto) if valid_arrays_crypto else 0
+    if min_plot_len_crypto > 0 and freq_alice is not None and len(freq_alice) >= min_plot_len_crypto:
+        common_freq_crypto=freq_alice[:min_plot_len_crypto]
+        axs[1].plot(common_freq_crypto,dev_alice[:min_plot_len_crypto],label="Alice's Ripples (Key A)",color=lime_green,lw=2,alpha=0.8)
+        axs[1].plot(common_freq_crypto,dev_bob[:min_plot_len_crypto],label="Bob's Ripples (Key A Reproduced)",color='white',linestyle=':',lw=3,alpha=0.7)
+        axs[1].plot(common_freq_crypto,dev_eve[:min_plot_len_crypto],label="Eve's Ripples (Key E Attempt)",color=gold_yellow,linestyle='--',lw=2,alpha=0.8)
+        if any(d > 0 for d_arr in [dev_alice,dev_bob,dev_eve] if d_arr is not None for d in d_arr[:min_plot_len_crypto] if np.isfinite(d)):
+             axs[1].set_yscale('log')
+    else: axs[1].text(0.5,0.5,"Crypto ripple data insufficient.",transform=axs[1].transAxes,ha="center",color="gray")
+    axs[1].set_xlabel("Frequency (Arbitrary Units from FFT bins)"); axs[1].set_ylabel("Ripple Deviation (Log Scale)"); axs[1].legend()
+    plt.savefig("hce_q5_qc_crypto.png",dpi=150,facecolor='black')
+    print("  Q5 visualization saved to hce_q5_qc_crypto.png")
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    plt.close('all') 
+    print("=== HCE Theoretical Exploration Framework ===")
+    print(f"Using EPSILON_PHI_VALUE: {EPSILON_PHI_VALUE}")
+    print(f"Global HYPERMORPHIC_MODE: {HYPERMORPHIC_MODE}")
+
+    test_q1_induce_hce_artificially()
+    test_q2_hce_consciousness()
+    test_q3_hce_spacetime_curvature()
+    test_q4_hce_dark_matter_energy()
+    test_q5_hce_quantum_computing_crypto()
+
+    print("\n\n=== All Conceptual HCE Analyses Complete ===")
+    print("Visualizations saved as PNG files in the current directory.")
+    
+    theoretical_discussion_text_block = """
+--- Theoretical Discussion: HyperMorphic Contextual Entanglement (HCE) ---
+
+This section outlines key theoretical questions and research directions related to
+HyperMorphic Contextual Entanglement (HCE) that this analytical framework aims to explore.
+Answers and further hypotheses would be developed based on experimental results and
+further theoretical work. (Visualizations above are conceptual illustrations based on HNum math).
+
+Key Questions:
+
+1.  Can HCE be induced artificially in laboratory systems?
+    -   Hypothesis: Specific configurations of high-density, rapidly changing quantum fields,
+        or precisely tuned electromagnetic pulses within resonant cavities containing
+        exotic materials, might create localized HCE conditions.
+    -   Experimental Approach: Design experiments involving [e.g., Bose-Einstein condensates
+        subjected to complex EM fields, high-energy plasma interactions, metamaterial
+        structures interacting with entangled particle beams].
+    -   Observable Signatures: Look for anomalous energy fluctuations, non-local correlations
+        exceeding Bell's inequalities in unexpected ways, or transient changes in local
+        spacetime metrics (if measurable).
+
+2.  What is the relationship between HCE and consciousness?
+    -   Hypothesis: If consciousness arises from complex, highly integrated information
+        processing, HCE might provide a physical mechanism for non-local aspects of
+        consciousness or a deeper level of interconnectedness in neural processing.
+        This is highly speculative.
+    -   Research Direction: Explore if HCE-like patterns (e.g., specific ripple deviation
+        signatures, phase coherence anomalies) correlate with complex cognitive tasks or
+        states of heightened awareness in neurobiological data, if HCE can be linked to
+        quantum processes in the brain (e.g., Penrose-Hameroff Orch-OR theory, though controversial).
+    -   Challenges: Establishing a causal link would be extremely difficult. Correlation
+        does not imply causation. Defining and measuring "consciousness" operationally
+        is a major hurdle.
+
+3.  How does HCE interact with classical spacetime curvature?
+    -   Hypothesis: HCE might represent fine-grained, context-dependent modulations of
+        the quantum vacuum that, on a macroscopic scale, could subtly influence or be
+        influenced by classical spacetime curvature. It might manifest as localized,
+        transient deviations from expected General Relativity (GR) effects.
+    -   Theoretical Framework: Attempt to extend GR or quantum field theory in curved
+        spacetime to include HNum-like mathematical structures or context-dependent
+        vacuum states.
+    -   Potential Observations: Look for unexpected residuals in precision GR tests
+        (e.g., gravitational lensing, frame-dragging) in regions where HCE is theorized
+        to be strong (e.g., near massive compact objects, early universe).
+
+4.  Can HCE explain dark matter/energy through morphic field effects?
+    -   Hypothesis: The cumulative effect of HCE-induced morphic fields (if such fields
+        are a consequence of HCE) across cosmological scales might manifest as an
+        apparent gravitational effect mimicking dark matter, or as a pervasive vacuum
+        energy component contributing to cosmic acceleration (dark energy).
+    -   Model Development: Develop cosmological models where HCE-derived morphic fields
+        contribute to the universe's stress-energy tensor or modify gravitational laws
+        on large scales. (This script provides a toy model visualization for this concept).
+    -   Constraints: Models must be consistent with existing cosmological observations
+        (CMB, large-scale structure, Type Ia supernovae). This is a significant challenge.
+
+5.  What are the implications for quantum computing and cryptography?
+    -   Quantum Computing Hypothesis: If HCE allows for richer, context-dependent forms
+        of entanglement or non-local correlations, it might lead to new types of qubits
+        ("H-qubits") or quantum gates with enhanced computational power or resilience
+        to certain types of decoherence.
+    -   Research: Investigate if the HNum algebra can describe novel quantum states or
+        operations. Explore if systems exhibiting HCE signatures (even if simulated
+        initially) can solve problems intractable for standard quantum computers.
+    -   Cryptography Hypothesis: HCE might enable new cryptographic protocols based on
+        the difficulty of predicting or replicating specific contextual ripple patterns,
+        or by leveraging unique non-local correlations for key distribution or message
+        authentication.
+    -   Challenges: Physical realization of HCE-based quantum systems is a primary
+        obstacle. Theoretical security proofs for HCE-based cryptography would be needed.
+
+Further Research Areas:
+    -   Mathematical formalization of HCE within established physics frameworks.
+    -   Development of experimental protocols to detect or induce HCE.
+    -   Simulation of HCE effects in astrophysical and cosmological scenarios.
+    -   Exploration of HCE in condensed matter systems or high-energy physics.
+"""
+    print(theoretical_discussion_text_block)
+    print("\nTo view plots, check the PNG files generated in the script's directory (e.g., hce_q1_*.png).")
+
